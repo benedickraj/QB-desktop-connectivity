@@ -1,0 +1,8 @@
+qb_cred:                
+    dsn_name : 'QuickBooks Data'    # modify dsn from 'odbc data sources(64)'
+bucket_cred:
+    bucket_name : 'qb-desktop'
+    orgid : 'd6dd057b-c0f7-4668-86a6-81e62ada76a3'
+    datasetid : '66fe35f5-BultNFzHi'
+    bucket_key : ""
+    
