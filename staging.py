@@ -16,6 +16,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import asyncio
+import sys
 
 script_path = Path(__file__).resolve() if '__file__' in globals() else Path(sys.argv[0]).resolve()
 script_dir = script_path.parent
@@ -76,17 +77,15 @@ try:
         try:
             if 'parameters' not in query.lower() and type.lower() == 'report':
                 print('No paramaters given in query. Fetching data with default parameter This Month To Date')
-                return query.strip()
+                return [query.strip()]
             if type.lower() == 'report':
                 date_pattern = r"(DateFrom\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\}.*?DateTo\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\})"
                 match = re.search(date_pattern, query, re.IGNORECASE | re.DOTALL)
-                match.group()
             elif type.lower() == 'table':
                 date_pattern = r"(?i)(transaction\.TimeModified\s*between\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s*and\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\})"
                 match = re.search(date_pattern, query, re.IGNORECASE | re.DOTALL)
-                print(match.group())
             if not match:
-                return query.strip()
+                return [query.strip()]
             
             
             full_match, start_date_str, end_date_str = match.groups() if type.lower() == 'report' else (match.group(1), match.group(2), match.group(4))
@@ -253,7 +252,7 @@ try:
         result = ""
         config_file_path = config_cred_path
         with open(config_file_path, 'r') as file:
-            config = yaml.safe_load(file)  
+            config = yaml.safe_load(file) 
         cred=decode_bucket_cred(config['bucket_cred']['bucket_key'])
         json_key = decode_bucket_cred(config['bucket_cred']['bucket_key'])
         cred = json.loads(json_key)
@@ -334,6 +333,7 @@ try:
             
             connection = pyodbc.connect(f'DSN={dsn_name}', autocommit=True)
             logger.info(f" >> Successfully connected with Quickbooks\n")
+            print('Successfully connected with Quickbooks')
             cred = decode_bucket_cred(config['bucket_cred']['bucket_key'])
             json_key = decode_bucket_cred(config['bucket_cred']['bucket_key'])
             cred = json.loads(json_key)
@@ -381,7 +381,7 @@ try:
                 audit_column = row[config_df.columns.index('Audit_Column')].strip()
                 backup_version = row[config_df.columns.index('Delta_version')]
                 if backup_version == '':
-                    backup_version = 0
+                    backup_version = -1
                 version = int(backup_version)
 
                 load_config.update_cell(row_count,run_status_column,'Running')
@@ -401,9 +401,10 @@ try:
                 
                 load_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 query_list = split_query_by_month(source_query, table_type) 
-
+                total_chunks = len(query_list)
                 retry_times = 3
-                       
+                logger.info(f'>> Processing {table_name}: {total_chunks} chunk(s) identified.')
+                print(f'Processing {table_name}: {total_chunks} chunk(s) identified.')      
                 
                 for i, query in enumerate(query_list, start=1):
 
