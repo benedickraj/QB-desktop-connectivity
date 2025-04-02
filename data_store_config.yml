@@ -1,8 +1,8 @@
 qb_cred:                
     dsn_name : 'QuickBooks Data'    # modify dsn from 'odbc data sources(64)'
 bucket_cred:
-    bucket_name : ''   # enter bucket name here
-    orgid : ''   # enter organization id here
-    datasetid : ''    # enter dataset id here
-    bucket_key : ''    # enter bucket key here
+    bucket_name :   # enter bucket name here
+    orgid :    # enter organization id here
+    datasetid :    # enter dataset id here
+    bucket_key :    # enter bucket key here
     

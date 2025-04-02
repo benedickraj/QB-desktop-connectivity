@@ -32,8 +32,8 @@ file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(mes
 logger.addHandler(file_handler)
 
 try:
-  
-
+    
+    
     async def read_database(connection,query,table,itr_count):
         
         try:
@@ -72,32 +72,93 @@ try:
             logger.error(f" >> \t Error in decoding the bucket with key {encoded_str} : {str(e)}\n")
             return None 
     
+     
+
     def split_query_by_month(query,type,current_date_flag):
-        
+
         try:
+            excecute = 0
             if 'parameters' not in query.lower() and type.lower() == 'report':
                 print('No paramaters given in query. Fetching data with default parameter This Month To Date')
                 return [query.strip()]
             if type.lower() == 'report':
                 date_pattern = r"(DateFrom\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\}.*?DateTo\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\})"
                 match = re.search(date_pattern, query, re.IGNORECASE | re.DOTALL)
+                if not match :
+                    date_patterns = [r"(DateFrom\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\}.*?,)" ,r"(DateFrom\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\}.*?)"]
+                    for pattern in date_patterns:
+                        match = re.search(pattern, query, re.IGNORECASE | re.DOTALL)
+                        if match:
+                            break
+                    if not match:
+                        return [query.strip()]
+                    full_match, start_date_str, end_date_str = match.group(1),match.group(2),datetime.now().strftime("%Y-%m-%d")
+                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+                    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+                    excecute = 1
             elif type.lower() == 'table':
-                date_pattern = r"(?i)(transaction\.TimeModified\s*between\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s*and\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\})"
+                date_pattern = r"(?i)(TimeModified\s*between\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s*and\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\})"
                 match = re.search(date_pattern, query, re.IGNORECASE | re.DOTALL)
+                if not match :
+                    date_patterns = [r"(?i)(TimeModified\s*between\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s*and)" ,r"(?i)(TimeModified\s*between\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s)"]
+                    for pattern in date_patterns:
+                        match = re.search(pattern, query, re.IGNORECASE | re.DOTALL)
+                        if match:
+                            break
+                    if not match and current_date_flag.lower() == 'y':
+                        date_patterns = [r"(?i)(TimeModified\s*>\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s)",r"(?i)(TimeModified\s*<\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s)",r"(?i)(TimeModified\s*>=\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s)",r"(?i)(TimeModified\s*<=\s*{ts'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d{3})'\}\s)",r"(?i)(TimeModified\s*>\s)",r"(?i)(TimeModified\s*<\s)",r"(?i)(TimeModified\s*<=\s)",r"(?i)(TimeModified\s*>=\s)"]
+                        for pattern in date_patterns:
+                            match = re.search(pattern, query, re.IGNORECASE | re.DOTALL)
+                            if match:
+                                full_match = match.group(1)
+                                if '>=' in full_match:
+                                    modified_query = query.replace(
+                                        full_match,
+                                        f"TimeModified >= {{ts'{datetime.now().strftime('%Y-%m-%d')} 00:00:00.000'}} "
+                                    ).strip()
+                                    return [modified_query.replace("\n", " ")]
+                                
+                                elif '<=' in full_match:
+                                    modified_query = query.replace(
+                                        full_match,
+                                        f"TimeModified <= {{ts'{datetime.now().strftime('%Y-%m-%d')} 00:00:00.000'}} "
+                                    ).strip()
+                                    return [modified_query.replace("\n", " ")]
+                                elif '>' in full_match:
+                                    modified_query = query.replace(
+                                        full_match,
+                                        f"TimeModified > {{ts'{datetime.now().strftime('%Y-%m-%d')} 00:00:00.000'}} "
+                                    ).strip()
+                                    return [modified_query.replace("\n", " ")]
+                                elif '<' in full_match:
+                                    modified_query = query.replace(
+                                        full_match,
+                                        f"TimeModified < {{ts'{datetime.now().strftime('%Y-%m-%d')} 00:00:00.000'}} "
+                                    ).strip()
+                                    return [modified_query.replace("\n", " ")]
+                               
+                    if not match: 
+                        return [query.strip()]
+                    full_match, start_date_str, end_date_str = match.group(1), match.group(2), datetime.now().strftime("%Y-%m-%d")
+                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+                    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+                    excecute = 1
             if not match:
                 return [query.strip()]
             
             
-            full_match, start_date_str, end_date_str = match.groups() if type.lower() == 'report' else (match.group(1), match.group(2), match.group(4))
+            if excecute == 0:
+                full_match, start_date_str, end_date_str = match.groups() if type.lower() == 'report' else (match.group(1), match.group(2), match.group(4))
+                start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+                if current_date_flag.lower() == 'y':
+                    end_date_str = datetime.now().strftime("%Y-%m-%d")
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
             
-            start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
-            if current_date_flag == 'Y':
-                end_date_str = datetime.now().strftime("%Y-%m-%d")
-            end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
-            logger.info(f' >> Processing the {type} from {start_date_str} to {end_date_str}\n')
 
             queries = []
-            
+
+            logger.info(f' >> Processing the {type} from {start_date_str} to {end_date_str}\n') 
+
             current_date = start_date
             if type.lower() == 'report':
                 while current_date <= end_date:
@@ -123,10 +184,10 @@ try:
                 month_end = next_month - timedelta(days=1)
                 month_start, month_end = max(month_start, start_date), min(month_end, end_date)
 
-                
+
                 modified_query = query.replace(
                     full_match,
-                    f"transaction.TimeModified BETWEEN {{ts'{month_start.strftime('%Y-%m-%d')} 00:00:00.000'}} "
+                    f"TimeModified BETWEEN {{ts'{month_start.strftime('%Y-%m-%d')} 00:00:00.000'}} "
                     f"AND {{ts'{month_end.strftime('%Y-%m-%d')} 23:59:59.999'}}"
                 ).strip()
 
@@ -139,6 +200,7 @@ try:
         except Exception as e:
             logger.error(f">> Error in chunking the query => {query} : {str(e)}\n")
             return None 
+        
         
     def datatype_conversion(df,table_name):
         
@@ -318,6 +380,34 @@ try:
         except Exception as e:
             result= "Email sending failed:", str(e) 
 
+    async def connect_to_qodbc(dsn_name, max_retries=3, timeout=600):
+        retries = 0
+        while retries < max_retries:
+            try:
+                connection = await asyncio.wait_for(
+                    asyncio.to_thread(pyodbc.connect, f'DSN={dsn_name}', autocommit=True), 
+                    timeout=timeout
+                )
+                logger.info(f'Quickbooks Connected successfully..\n')
+                print("Quickbooks Connected successfully!")
+                return connection, False  
+            except asyncio.TimeoutError:
+                retries += 1
+                print(f"Attempt {retries}: Timeout occurred. Retrying in 5 minutes...")
+                logger.info(f'Attempt {retries}: Timeout occurred. Retrying in 5 minutes...\n')
+                await asyncio.sleep(300) 
+            except pyodbc.Error as e1:
+                retries += 1
+                print(f" >> Error in Initialing Quickbooks => {str(e1)}")
+                logger.info(f'>> Error in Initialing Quickbooks => {str(e1)}\n')
+                logger.info(f"Attempt {retries}: unable to connect quickbooks through pyodbc..Retrying in 5 minutes...")
+                await asyncio.sleep(300) 
+            except Exception as e:
+                logger.error(f'Unexpected error while Quickbooks connection => {e}\n')
+                return None, True 
+             
+        logger.error(f'Max retries reached. Connection failed..\n')
+        return None, True
 
     async def main():
         
@@ -335,9 +425,10 @@ try:
 
         try: 
             
-            connection = pyodbc.connect(f'DSN={dsn_name}', autocommit=True)
-            logger.info(f" >> Successfully connected with Quickbooks\n")
-            print('Successfully connected with Quickbooks')
+            connection, failed = await connect_to_qodbc(dsn_name)
+            if failed :
+                logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
+                return
             cred = decode_bucket_cred(config['bucket_cred']['bucket_key'])
             json_key = decode_bucket_cred(config['bucket_cred']['bucket_key'])
             cred = json.loads(json_key)
@@ -461,10 +552,6 @@ try:
                 load_config.update_cell(row_count, start_date_column, load_start_time)
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
 
-        except pyodbc.Error as e1:
-            print(f" >> Error in Initialing Quickbooks => {str(e1)}")
-            logger.error(f" >> Error in Initialing Quickbooks => {str(e1)}\n")
-            return 
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
             return
