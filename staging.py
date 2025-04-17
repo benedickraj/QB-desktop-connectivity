@@ -505,7 +505,7 @@ try:
                 logger.info(f">> Processing {table_name}: {total_chunks} chunk(s) identified\n")
                 print(f'Processing {table_name}: {total_chunks} chunk(s) identified.')      
                 load_config.update_cell(row_count, start_date_column, load_start_time)
-                
+
                 brk_toggle = False
 
                 for i, query in enumerate(query_list, start=1):
@@ -574,6 +574,7 @@ try:
                             logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
                             load_config.update_cell(row_count,run_status_column,'Failed')  
                             upd_version=setVersion(table_name,table_path,storage_options,backup_version)
+                            version = upd_version
                             load_config.update_cell(row_count,delta_version_column,upd_version)
                             brk_toggle = True
                             break
