@@ -509,7 +509,7 @@ try:
                     itr_count=i    
                     executions = 1
                     enable_retry = True
-
+                    itr_toggle = True
                     while executions <= retry_times and enable_retry:
                         df, enable_retry = await read_database(connection,query,table_name,itr_count) 
 
@@ -552,6 +552,7 @@ try:
                             res = load_data(df,primary_columns,table_path,overwrite,load_type,storage_options)
                             if res['status'] == 'success' and itr_count == total_chunks:
                                 load_config.update_cell(row_count,run_status_column,'Success')
+                                itr_toggle = False
                             if res['status'] == 'success':
                                 version = version + 1
                                 
@@ -565,7 +566,13 @@ try:
                             upd_version=setVersion(table_name,table_path,storage_options,backup_version)
                             load_config.update_cell(row_count,delta_version_column,upd_version)
                             break
+
+                        if itr_count == total_chunks and itr_toggle:
+                            load_config.update_cell(row_count,run_status_column,"Last chunk completed but not uploaded to delta")
+
                     overwrite = False 
+
+
 
                 load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
