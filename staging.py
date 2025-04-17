@@ -59,8 +59,9 @@ try:
             
         except Exception as e:
             logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
+            run_connection.close()
             print(f'Error in dsn : {e}')
-            return None,False
+            return None,True
 
     def decode_bucket_cred(encoded_str):
         
@@ -504,12 +505,19 @@ try:
                 logger.info(f">> Processing {table_name}: {total_chunks} chunk(s) identified\n")
                 print(f'Processing {table_name}: {total_chunks} chunk(s) identified.')      
                 load_config.update_cell(row_count, start_date_column, load_start_time)
+                
+                brk_toggle = False
+
                 for i, query in enumerate(query_list, start=1):
+
+                    if brk_toggle:
+                        break
 
                     itr_count=i    
                     executions = 1
                     enable_retry = True
                     itr_toggle = True
+                    
                     while executions <= retry_times and enable_retry:
                         df, enable_retry = await read_database(connection,query,table_name,itr_count) 
 
@@ -528,6 +536,7 @@ try:
                         
                         elif df is None:
                             logger.info(f">> Interrupting the code as the query failed executing\n")
+                            brk_toggle = True
                             break
 
                         elif df.shape[0]==0:
@@ -543,6 +552,7 @@ try:
                                 load_config.update_cell(row_count,run_status_column,'Failed')  
                                 upd_version=setVersion(table_name,table_path,storage_options,backup_version)
                                 load_config.update_cell(row_count,delta_version_column,upd_version)
+                                brk_toggle = True
                                 break
                             
 
@@ -565,6 +575,7 @@ try:
                             load_config.update_cell(row_count,run_status_column,'Failed')  
                             upd_version=setVersion(table_name,table_path,storage_options,backup_version)
                             load_config.update_cell(row_count,delta_version_column,upd_version)
+                            brk_toggle = True
                             break
 
                         if itr_count == total_chunks and itr_toggle:
