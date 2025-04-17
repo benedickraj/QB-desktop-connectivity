@@ -33,7 +33,7 @@ logger.addHandler(file_handler)
 
 try:
     
-    
+
     async def read_database(connection,query,table,itr_count):
         
         try:
@@ -51,7 +51,7 @@ try:
 
         try:
             print(f' >> reading query-->')
-            logger.info(f' >> Reading query for table {table}-->\n')
+            logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
             print(f"Executing chunk {itr_count} for the table {table}")
             sql_query = run_query
             out_df = pl.read_database(sql_query, run_connection)
@@ -501,9 +501,9 @@ try:
                 query_list = split_query_by_month(source_query, table_type,current_date_flag) 
                 total_chunks = len(query_list)
                 retry_times = 3
-                logger.info(f'>> Processing {table_name}: {total_chunks} chunk(s) identified.')
+                logger.info(f">> Processing {table_name}: {total_chunks} chunk(s) identified\n")
                 print(f'Processing {table_name}: {total_chunks} chunk(s) identified.')      
-                
+                load_config.update_cell(row_count, start_date_column, load_start_time)
                 for i, query in enumerate(query_list, start=1):
 
                     itr_count=i    
@@ -513,11 +513,15 @@ try:
                     while executions <= retry_times and enable_retry:
                         df, enable_retry = await read_database(connection,query,table_name,itr_count) 
 
-                        if df is None :
+                        if df is None and enable_retry:
                             logger.info(f">> Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
                             enable_retry = True
                             print(f"Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
                             connection = pyodbc.connect(f'DSN={dsn_name}', autocommit=True)
+                        
+                        elif df is None:
+                            logger.info(f">> Interrupting the code as the query failed executing\n")
+                            break
 
                         elif df.shape[0]==0:
                             connection.close()
@@ -535,7 +539,7 @@ try:
                                 load_config.update_cell(row_count,run_status_column,'Success')
                             if res['status'] == 'success':
                                 version = version + 1
-                                load_config.update_cell(row_count,delta_version_column,version)
+                                
 
                         executions = executions + 1 
 
@@ -549,8 +553,8 @@ try:
                     overwrite = False 
 
                 load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-                load_config.update_cell(row_count, start_date_column, load_start_time)
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
+                load_config.update_cell(row_count,delta_version_column,version)
 
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
