@@ -516,8 +516,15 @@ try:
                         if df is None and enable_retry:
                             logger.info(f">> Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
                             enable_retry = True
-                            print(f"Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
-                            connection = pyodbc.connect(f'DSN={dsn_name}', autocommit=True)
+                            print(f"Retrying the same query for table {table_name} as failing in passing query through pyodbc..Initiating the Quicbooks connection again\n")
+                            connection, failed = await connect_to_qodbc(dsn_name)
+                            if failed :
+                                logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
+                                logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
+                                load_config.update_cell(row_count,run_status_column,'Failed')  
+                                upd_version=setVersion(table_name,table_path,storage_options,backup_version)
+                                load_config.update_cell(row_count,delta_version_column,upd_version)
+                                break
                         
                         elif df is None:
                             logger.info(f">> Interrupting the code as the query failed executing\n")
@@ -526,10 +533,18 @@ try:
                         elif df.shape[0]==0:
                             connection.close()
                             print(f'Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt.')
-                            logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt.\n")
+                            logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt...Initiating the Quicbooks connection again\n")
                             time.sleep(180)
                             enable_retry = True
-                            connection = pyodbc.connect(f'DSN={dsn_name}', autocommit=True)
+                            connection, failed = await connect_to_qodbc(dsn_name)
+                            if failed :
+                                logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
+                                logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
+                                load_config.update_cell(row_count,run_status_column,'Failed')  
+                                upd_version=setVersion(table_name,table_path,storage_options,backup_version)
+                                load_config.update_cell(row_count,delta_version_column,upd_version)
+                                break
+                            
 
                         else :    
                             print(f'Data successfully retrieved for table {table_name} with count {df.shape}')
