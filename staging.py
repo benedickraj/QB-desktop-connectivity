@@ -30,6 +30,9 @@ logger.setLevel(logging.INFO)
 file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(console_handler)
 
 try:
     
@@ -41,7 +44,6 @@ try:
                 asyncio.to_thread(dsn_connection, connection, query,table,itr_count), timeout= 600
             )
         except asyncio.TimeoutError:
-            print(f'Time limit of 10 minutes exceeded while reading query ==> {query}')
             connection.close()
             logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
             return None,True
@@ -50,9 +52,7 @@ try:
         
 
         try:
-            print(f' >> reading query-->')
             logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
-            print(f"Executing chunk {itr_count} for the table {table}")
             sql_query = run_query
             out_df = pl.read_database(sql_query, run_connection)
             return out_df,False
@@ -60,7 +60,6 @@ try:
         except Exception as e:
             logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
             run_connection.close()
-            print(f'Error in dsn : {e}')
             return None,True
 
     def decode_bucket_cred(encoded_str):
@@ -80,7 +79,6 @@ try:
         try:
             excecute = 0
             if 'parameters' not in query.lower() and type.lower() == 'report':
-                print('No paramaters given in query. Fetching data with default parameter This Month To Date')
                 return [query.strip()]
             if type.lower() == 'report':
                 date_pattern = r"(DateFrom\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\}.*?DateTo\s*=\s*\{d'(\d{4}-\d{2}-\d{2})'\})"
@@ -213,7 +211,7 @@ try:
                         pl.col(cols).fill_null("").cast(pl.Utf8)
                     ])
                 elif "Date" in str(dtype[cols]):
-                    print(cols)
+
                     df = df.with_columns(
                         pl.col(cols).cast(pl.Utf8)
                     )
@@ -232,12 +230,10 @@ try:
                     df = df.with_columns(
                         pl.col(cols).cast(pl.Boolean))
                     
-            print(f"Data type conversion done for {table_name}")
             logger.info(f" >> \t Datatype conversion done for {table_name}\n")
             return df
         
         except Exception as e:
-            print(f'Failed in the datatype_conversion {str(e)}')
             logger.error(f" >> Failed in the datatype_conversion {str(e)}\n")
             return None
      
@@ -247,15 +243,12 @@ try:
             if load_type.lower() == 'full':
                 if overwrite:
                     mode = "overwrite"
-                    print("Loading data in Overwrite mode...")
                     logger.info(f" >> Loading the data in overwrite mode\n")
                 else:
                     mode = "append"
                     logger.info(f" >> Loading the data in append mode\n")
-                    print("Loading data in Append mode...")
             else:
                 mode = "merge"
-                print("Loading data in Delta mode...")
                 logger.info(f" >> Loading the data in delta mode\n")
             
             delta_write_options = {'schema_mode': 'overwrite'} if mode == "overwrite" else {}
@@ -269,9 +262,6 @@ try:
                     "target_alias": "tgt",
                 }
                 
-                print(f'DeltaTable Merge Predicate ----> {predicate}')
-                print(f'DeltaTable Merge options ----> {delta_merge_options}')
-                print(f'DeltaTable Write options ----> {delta_write_options}')
             
                 res = df.write_delta(
                     table_path,
@@ -281,10 +271,10 @@ try:
                     delta_merge_options=delta_merge_options
                 ).when_matched_update_all().when_not_matched_insert_all().execute()
             
-                print(f'Deltalake Merge Response ----> {res}')
+                
                 
             else:
-                print(f'DeltaTable Write options ----> {delta_write_options}')
+                
                 res = df.write_delta(
                     table_path,
                     storage_options=storage_options,
@@ -295,7 +285,6 @@ try:
             return {"status" : "success", "message" : "Data uploaded to Deltalake Successfully"}
                 
         except Exception as e:
-            print(f'Failed in the loading load_data function {str(e)}')
             logger.error(f" >> Failed in the loading files to the bucket => {str(e)}\n")
             return {'status' : 'failed', 'message' : f'{str(e)}'}
     
@@ -308,13 +297,12 @@ try:
             return latest_version['version']
         
         except Exception as e:
-            print(f'Error in getting version for the table {table_name} => {str(e)}')
             logger.error(f'Error in getting version for the table {table_name} => {str(e)}\n')
             return 
         
 
     def email_process(config_cred_path,file_path):
-        print('Processing the mail function')
+    
         
         result = ""
         config_file_path = config_cred_path
@@ -390,16 +378,13 @@ try:
                     timeout=timeout
                 )
                 logger.info(f'Quickbooks Connected successfully..\n')
-                print("Quickbooks Connected successfully!")
                 return connection, False  
             except asyncio.TimeoutError:
                 retries += 1
-                print(f"Attempt {retries}: Timeout occurred. Retrying in 5 minutes...")
                 logger.info(f'Attempt {retries}: Timeout occurred. Retrying in 5 minutes...\n')
                 await asyncio.sleep(300) 
             except pyodbc.Error as e1:
                 retries += 1
-                print(f" >> Error in Initialing Quickbooks => {str(e1)}")
                 logger.info(f'>> Error in Initialing Quickbooks => {str(e1)}\n')
                 logger.info(f"Attempt {retries}: unable to connect quickbooks through pyodbc..Retrying in 5 minutes...")
                 await asyncio.sleep(300) 
@@ -414,7 +399,6 @@ try:
         
         
         if not os.path.exists(config_file_path):
-            print({'status':'Failed','message':f'Config file does not exist in the path => {config_file_path}'})
             logger.info(f" >> Config file does not exist in the path => {config_file_path}\n")
             return
         logger.info(f'Config file fetched from path => {config_file_path}\n')
@@ -502,8 +486,7 @@ try:
                 query_list = split_query_by_month(source_query, table_type,current_date_flag) 
                 total_chunks = len(query_list)
                 retry_times = 3
-                logger.info(f">> Processing {table_name}: {total_chunks} chunk(s) identified\n")
-                print(f'Processing {table_name}: {total_chunks} chunk(s) identified.')      
+                logger.info(f">> Processing {table_name}: {total_chunks} chunk(s) identified\n")     
                 load_config.update_cell(row_count, start_date_column, load_start_time)
 
                 brk_toggle = False
@@ -524,7 +507,6 @@ try:
                         if df is None and enable_retry:
                             logger.info(f">> Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
                             enable_retry = True
-                            print(f"Retrying the same query for table {table_name} as failing in passing query through pyodbc..Initiating the Quicbooks connection again\n")
                             connection, failed = await connect_to_qodbc(dsn_name)
                             if failed :
                                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
@@ -541,7 +523,6 @@ try:
 
                         elif df.shape[0]==0:
                             connection.close()
-                            print(f'Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt.')
                             logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt...Initiating the Quicbooks connection again\n")
                             time.sleep(180)
                             enable_retry = True
@@ -557,7 +538,7 @@ try:
                             
 
                         else :    
-                            print(f'Data successfully retrieved for table {table_name} with count {df.shape}')
+                            
                             logger.info(f">> Data successfully retrieved for table {table_name} with count {df.shape}\n")
                             res = load_data(df,primary_columns,table_path,overwrite,load_type,storage_options)
                             if res['status'] == 'success' and itr_count == total_chunks:
@@ -601,17 +582,15 @@ try:
             loop = None
 
         if loop and loop.is_running():
-            print("Async event loop already running. Running main() in a new task.")
             logger.info(f" >> Function started and running in notebook\n")
             asyncio.create_task(main())
         else:
-            print("Starting new event loop")
             logger.info(f" >> Function started with a new event loop\n")
             asyncio.run(main())
 
 except Exception as e:
     logger.error(f" >> Encountered error \n{e}\n")
-    print(str(e))
+    
 
 
 finally:
