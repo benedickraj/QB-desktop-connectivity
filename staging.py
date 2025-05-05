@@ -5,6 +5,7 @@ import yaml
 import os
 import re
 import base64, json
+import concurrent.futures
 from google.cloud import storage
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -36,31 +37,63 @@ logger.addHandler(console_handler)
 
 try:
     
+    def run_query(query, connection):
+        try:
+            df = pl.read_database(query, connection)
+            return df
+        except Exception as e:
+            raise e
 
     async def read_database(connection,query,table,itr_count):
+        timeout = 10
+        loop = asyncio.get_event_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        task = loop.run_in_executor(executor, run_query, query, connection)
+        logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
         
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(dsn_connection, connection, query,table,itr_count), timeout= 600
-            )
+            result = await asyncio.wait_for(task, timeout)
+            return result, False
         except asyncio.TimeoutError:
             connection.close()
             logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
             return None,True
+        except Exception as e:
+            logger.error(f" >> Error in dsn while executing query {query} : {e}\n")
+            connection.close()
+            return None,True
+
+
+    # async def read_database(connection,query,table,itr_count):
+        
+    #     try:
+    #         logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
+    #         connection.timeout = 60
+    #         return await asyncio.wait_for(
+    #             asyncio.to_thread(pl.read_database, query,connection), timeout= 60
+    #         ), False
+    #     except asyncio.TimeoutError:
+    #         connection.close()
+    #         logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
+    #         return None,True
+    #     except Exception as e:
+    #         logger.error(f" >> Error in dsn while executing query {query} : {e}\n")
+    #         connection.close()
+    #         return None,True
     
-    def dsn_connection(run_connection, run_query,table,itr_count):
+    # def dsn_connection(run_connection, run_query,table,itr_count):
         
 
-        try:
-            logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
-            sql_query = run_query
-            out_df = pl.read_database(sql_query, run_connection)
-            return out_df,False
+    #     try:
+    #         logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
+    #         sql_query = run_query
+    #         out_df = pl.read_database(sql_query, run_connection)
+    #         return out_df,False
             
-        except Exception as e:
-            logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
-            run_connection.close()
-            return None,True
+    #     except Exception as e:
+    #         logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
+    #         run_connection.close()
+    #         return None,True
 
     def decode_bucket_cred(encoded_str):
         
@@ -70,10 +103,8 @@ try:
             return decoded_str
         except Exception as e:
             logger.error(f" >> \t Error in decoding the bucket with key {encoded_str} : {str(e)}\n")
-            return None 
-    
+            return None     
      
-
     def split_query_by_month(query,type,current_date_flag):
 
         try:
@@ -313,6 +344,7 @@ try:
         cred = json.loads(json_key)
         storage_options = {'service_account_key' : json.dumps(cred)}
         client = storage.Client.from_service_account_info(cred)
+        server_name = config['qb_cred']['server_name']
         bucket_name=config['bucket_cred']['bucket_name']
         orgid=config['bucket_cred']['orgid']
         datasetid = config['bucket_cred']['datasetid']
@@ -336,8 +368,8 @@ try:
 
         receiver_emails = list(set(receiver_emails))
 
-        subject = f"QBD log status"  # change subject here
-        message = f"Hello,\n\n Please find attached the text file containing the log status from the client system.\n\n Thanks,\n\n Team Conversight"  # change body here
+        subject = f"{server_name} - QBD Log Status"  # change subject here
+        message = f"Hello,\n\n Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n Thanks,\n\n Team Conversight"  # change body here
 
         # Create a message object
         msg = MIMEMultipart()
@@ -406,6 +438,7 @@ try:
             config = yaml.safe_load(file)  
         
         dsn_name = config['qb_cred']['dsn_name']
+        server_name = config['qb_cred']['server_name']
         
 
         try: 
@@ -440,7 +473,9 @@ try:
             ecred = ServiceAccountCredentials.from_json_keyfile_dict(ecred_key_dict,scopes=scope)
             eclient = gspread.authorize(ecred)
             Spreadsheet_name = config['excel_cred']['name']
-            worksheet_name = config['excel_cred']['sheet_name']
+            worksheet_name = config['server_mapping'][server_name]
+            logger.info(f'>> Fetching QuickBooks data from server {server_name} \n')
+            
             spreadsheet = eclient.open(Spreadsheet_name)
             load_config = spreadsheet.worksheet(worksheet_name)
             config_data = load_config.get_all_records()
@@ -566,11 +601,16 @@ try:
                     overwrite = False 
 
 
-
                 load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
                 load_config.update_cell(row_count,delta_version_column,version)
 
+        except gspread.exceptions.SpreadsheetNotFound:
+            logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
+            return
+        except gspread.exceptions.WorksheetNotFound:
+            logger.error(f'>> Worksheet "{worksheet_name}" not found in spreadsheet "{Spreadsheet_name}" \n')
+            return
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
             return
@@ -591,7 +631,6 @@ try:
 except Exception as e:
     logger.error(f" >> Encountered error \n{e}\n")
     
-
 
 finally:
 
