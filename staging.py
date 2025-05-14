@@ -5,7 +5,6 @@ import yaml
 import os
 import re
 import base64, json
-import concurrent.futures
 from google.cloud import storage
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -25,7 +24,8 @@ config_file_path = script_dir / "data_store_config.yml"
 log_dir = "log_history"
 os.makedirs(log_dir, exist_ok=True) 
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_filepath = os.path.join(log_dir, f'log_{timestamp}.txt')
+log_filename = f'log_{timestamp}.txt'
+log_filepath = os.path.join(log_dir, log_filename)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
@@ -34,66 +34,33 @@ logger.addHandler(file_handler)
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
+load_failed = False
 
 try:
-    
-    def run_query(query, connection):
-        try:
-            df = pl.read_database(query, connection)
-            return df
-        except Exception as e:
-            raise e
 
     async def read_database(connection,query,table,itr_count):
-        timeout = 10
-        loop = asyncio.get_event_loop()
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        task = loop.run_in_executor(executor, run_query, query, connection)
-        logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
-        
         try:
-            result = await asyncio.wait_for(task, timeout)
-            return result, False
+            return await asyncio.wait_for(
+                asyncio.to_thread(dsn_connection, connection, query,table,itr_count), timeout= 600
+                )
         except asyncio.TimeoutError:
             connection.close()
             logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
             return None,True
-        except Exception as e:
-            logger.error(f" >> Error in dsn while executing query {query} : {e}\n")
-            connection.close()
-            return None,True
-
-
-    # async def read_database(connection,query,table,itr_count):
-        
-    #     try:
-    #         logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
-    #         connection.timeout = 60
-    #         return await asyncio.wait_for(
-    #             asyncio.to_thread(pl.read_database, query,connection), timeout= 60
-    #         ), False
-    #     except asyncio.TimeoutError:
-    #         connection.close()
-    #         logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
-    #         return None,True
-    #     except Exception as e:
-    #         logger.error(f" >> Error in dsn while executing query {query} : {e}\n")
-    #         connection.close()
-    #         return None,True
     
-    # def dsn_connection(run_connection, run_query,table,itr_count):
+    def dsn_connection(run_connection, run_query,table,itr_count):
         
 
-    #     try:
-    #         logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
-    #         sql_query = run_query
-    #         out_df = pl.read_database(sql_query, run_connection)
-    #         return out_df,False
+        try:
+            logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
+            sql_query = run_query
+            out_df = pl.read_database(sql_query, run_connection)
+            return out_df,False
             
-    #     except Exception as e:
-    #         logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
-    #         run_connection.close()
-    #         return None,True
+        except Exception as e:
+            logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
+            run_connection.close()
+            return None,True
 
     def decode_bucket_cred(encoded_str):
         
@@ -324,7 +291,7 @@ try:
             delta_table = DeltaTable(table_path , storage_options=storage_options)
             delta_table.restore(backup_version)
             latest_version = delta_table.history()[0]
-            logger.info(f"updating the latest version for the table {table_name} => {latest_version['version']}")
+            logger.info(f"Updating the latest version for the table {table_name} to => {latest_version['version']}")
             return latest_version['version']
         
         except Exception as e:
@@ -332,8 +299,7 @@ try:
             return 
         
 
-    def email_process(config_cred_path,file_path):
-    
+    def email_process(load_failed, config_cred_path, file_path):
         
         result = ""
         config_file_path = config_cred_path
@@ -355,6 +321,13 @@ try:
         yaml_data = blob.download_as_bytes()
         config = yaml.safe_load(yaml_data)
         credential = config['mail_cred']
+        send_mail_if_success = True if config['send_mail_for_all_success'] == 'True' else False
+
+        # Upload log file to bucket
+        log_path_in_bucket = f'{orgid}/{datasetid}/quickbooks_log/{log_filename}'
+        log_blob = bucket.blob(log_path_in_bucket)
+        log_blob.upload_from_filename(file_path)
+        logger.info('>> Log file uploaded to bucket.\n')
         
         
         # Email configuration
@@ -367,8 +340,10 @@ try:
 
 
         receiver_emails = list(set(receiver_emails))
-
-        subject = f"{server_name} - QBD Log Status"  # change subject here
+        if load_failed:
+            subject = f'Failed QuickBooks load from server {server_name}' 
+        else:
+            subject = f"Successfull QuickBooks load from server {server_name}" 
         message = f"Hello,\n\n Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n Thanks,\n\n Team Conversight"  # change body here
 
         # Create a message object
@@ -390,16 +365,22 @@ try:
 
 
         try:
-            smtp = smtplib.SMTP(host=smtp_host, port=smtp_port)
-            smtp.starttls()
-            smtp.login(smtp_username, smtp_password)
-            smtp.sendmail(sender_email, receiver_emails, msg.as_string())
+            if send_mail_if_success or load_failed:
+                smtp = smtplib.SMTP(host=smtp_host, port=smtp_port)
+                smtp.starttls()
+                smtp.login(smtp_username, smtp_password)
+                smtp.sendmail(sender_email, receiver_emails, msg.as_string())
 
-            result = f"Email has been sent successfully to -> {','.join(receiver_emails)}"
-            return result
-        
+                result = f"Email has been sent successfully to -> {','.join(receiver_emails)}"
+                logger.info('>> Email sent successfully.\n')
+                return result
+            
+            else:   
+                logger.info('>> Email is not configured to send.\n') 
+                return 'Email not configured to send.'
+            
         except Exception as e:
-            result= "Email sending failed:", str(e) 
+            result = "Email sending failed:", str(e) 
 
     async def connect_to_qodbc(dsn_name, max_retries=3, timeout=600):
         retries = 0
@@ -428,8 +409,7 @@ try:
         return None, True
 
     async def main():
-        
-        
+        global load_failed
         if not os.path.exists(config_file_path):
             logger.info(f" >> Config file does not exist in the path => {config_file_path}\n")
             return
@@ -446,6 +426,7 @@ try:
             connection, failed = await connect_to_qodbc(dsn_name)
             if failed :
                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
+                load_failed = True
                 return
             cred = decode_bucket_cred(config['bucket_cred']['bucket_key'])
             json_key = decode_bucket_cred(config['bucket_cred']['bucket_key'])
@@ -515,7 +496,6 @@ try:
                         source_query = source_query + f" AND {table_name}.{audit_column} between {{ts'{start_date}'}} and {{ts'{currenttime.strftime('%Y-%m-%d %H:%M:%S.%f')}'}}"
                     else:
                         source_query = source_query + f" where {table_name}.{audit_column} between {{ts'{start_date}'}} and {{ts'{currenttime.strftime('%Y-%m-%d %H:%M:%S.%f')}'}}"
-                
 
                 load_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 query_list = split_query_by_month(source_query, table_type,current_date_flag) 
@@ -545,9 +525,9 @@ try:
                             connection, failed = await connect_to_qodbc(dsn_name)
                             if failed :
                                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
-                                logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
+                                logger.info(f" >> Failed to load {table_name}. Updating the delta table to the backup version {backup_version}")
                                 load_config.update_cell(row_count,run_status_column,'Failed')  
-                                upd_version=setVersion(table_name,table_path,storage_options,backup_version)
+                                upd_version = setVersion(table_name,table_path,storage_options,backup_version)
                                 load_config.update_cell(row_count,delta_version_column,upd_version)
                                 break
                         
@@ -587,6 +567,7 @@ try:
 
                         if executions > retry_times and df is None:
                             logger.info(f" >> Maximum retries reached for the query {query}\n")
+                            load_failed = True
                             logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
                             load_config.update_cell(row_count,run_status_column,'Failed')  
                             upd_version=setVersion(table_name,table_path,storage_options,backup_version)
@@ -600,16 +581,17 @@ try:
 
                     overwrite = False 
 
-
                 load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
                 load_config.update_cell(row_count,delta_version_column,version)
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
+            load_failed = True
             return
         except gspread.exceptions.WorksheetNotFound:
             logger.error(f'>> Worksheet "{worksheet_name}" not found in spreadsheet "{Spreadsheet_name}" \n')
+            load_failed = True
             return
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
@@ -633,6 +615,6 @@ except Exception as e:
     
 
 finally:
-
-    logger.info(f" >> code execution completed and ready to send mail\n")    
-    email_process(config_file_path,log_filepath)
+    logger.info(f" >> Code execution completed and ready to send mail\n")
+    email_process(load_failed, config_file_path, log_filepath)
+    
