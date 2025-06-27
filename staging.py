@@ -17,6 +17,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import asyncio
 import sys
+import subprocess
+from pywinauto import Application
 
 script_path = Path(__file__).resolve() if '__file__' in globals() else Path(sys.argv[0]).resolve()
 script_dir = script_path.parent
@@ -35,6 +37,11 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 load_failed = False
+
+with open(config_file_path, 'r') as file:
+    config = yaml.safe_load(file)  
+        
+dsn_names = [dsn.strip() for dsn in config['qb_cred']['dsn_name'].split(',')]
 
 try:
 
@@ -72,6 +79,80 @@ try:
             logger.error(f" >> \t Error in decoding the bucket with key {encoded_str} : {str(e)}\n")
             return None     
      
+    def is_quickbooks_running():
+        try:
+            output = subprocess.check_output('tasklist', shell=True).decode()
+            return 'QBW.EXE' in output
+        except Exception as e:
+            logger.error("Error checking task list:", e)
+            return False
+    
+    def logout_quickbooks(qb_path):
+        if not is_quickbooks_running():
+            logger.info("QuickBooks is not running. Exiting...")
+            return
+
+        try:
+            app = Application(backend='uia').connect(path=rf'{qb_path}')
+            logger.info("Connected to QuickBooks application.")
+            main_win = None
+            for win in app.windows():
+                title = win.window_text()
+                if "Intuit QuickBooks" in title:
+                    logger.info(f"Found QuickBooks window: {title}")
+                    main_win = win
+                    break
+            if main_win:
+                main_win.set_focus()
+                logger.info("QuickBooks window activated.")
+        except Exception as e:
+            logger.error(f"Failed to connect to QuickBooks window: {e}")
+            return
+
+        # Access 'File' menu and 'Close Company/Logoff'
+        try:
+            # Use the top menu bar
+            logger.info("Attempting to open File menu...")
+            main_win.type_keys("%F", set_foreground=True)
+            time.sleep(0.5) 
+            main_win.type_keys("C")
+            logger.info("Logout option selected from File menu.")
+        except Exception as e:
+            logger.error(f"Menu navigation failed: {e}")
+            return
+
+        # Handle optional backup/save dialog
+        time.sleep(2)
+        try:
+            logger.info("Checking for backup/save dialogs...")
+            children = main_win.children()
+            
+            backup_dialog = None
+            for child in children:
+                if child.window_text() == "Automatic Backup" and child.friendly_class_name() == "Dialog":
+                    backup_dialog = child
+                    break
+            if backup_dialog:
+                no_button = None
+                for child in backup_dialog.children():
+                    if child.window_text() == "No":
+                        no_button = child
+                        break
+                
+                if no_button:
+                    no_button.click_input()
+                    logger.info("Clicked 'No' on the 'Automatic Backup' dialog.")
+                else:
+                    logger.warning("Could not locate the 'No' button within the 'Automatic Backup' dialog.")
+            else:
+                logger.info("The 'Automatic Backup' dialog did not appear among the main window's children.")
+        except Exception as e:
+            logger.warning(f"Could not handle backup dialog: {e}")
+            
+        logger.info("Logged out of QuickBooks successfully.")
+        return
+
+    
     def split_query_by_month(query,type,current_date_flag):
 
         try:
@@ -341,9 +422,9 @@ try:
 
         receiver_emails = list(set(receiver_emails))
         if load_failed:
-            subject = f'Failed QuickBooks load from server {server_name}' 
+            subject = f'{server_name} - Failed QuickBooks load' 
         else:
-            subject = f"Successfull QuickBooks load from server {server_name}" 
+            subject = f"{server_name} - Successful QuickBooks load" 
         message = f"Hello,\n\n Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n Thanks,\n\n Team Conversight"  # change body here
 
         # Create a message object
@@ -382,7 +463,7 @@ try:
         except Exception as e:
             result = "Email sending failed:", str(e) 
 
-    async def connect_to_qodbc(dsn_name, max_retries=3, timeout=600):
+    async def connect_to_qodbc(qb_path, dsn_name, max_retries=3, timeout=600):
         retries = 0
         while retries < max_retries:
             try:
@@ -391,16 +472,22 @@ try:
                     timeout=timeout
                 )
                 logger.info(f'Quickbooks Connected successfully..\n')
-                return connection, False  
+                return connection, False 
+            
             except asyncio.TimeoutError:
                 retries += 1
                 logger.info(f'Attempt {retries}: Timeout occurred. Retrying in 5 minutes...\n')
                 await asyncio.sleep(300) 
             except pyodbc.Error as e1:
                 retries += 1
-                logger.info(f'>> Error in Initialing Quickbooks => {str(e1)}\n')
-                logger.info(f"Attempt {retries}: unable to connect quickbooks through pyodbc..Retrying in 5 minutes...")
-                await asyncio.sleep(300) 
+                error_message = str(e1)
+                logger.info(f'>> Error in Initialing Quickbooks => {error_message}\n')
+                if '8004040a' in error_message:
+                    logger.info('QuickBooks is already logged in with another file. Logging out...\n')
+                    logout_quickbooks(qb_path)
+                else:
+                    logger.info(f"Attempt {retries}: unable to connect quickbooks through pyodbc..Retrying in 5 minutes...")
+                    await asyncio.sleep(300) 
             except Exception as e:
                 logger.error(f'Unexpected error while Quickbooks connection => {e}\n')
                 return None, True 
@@ -408,34 +495,37 @@ try:
         logger.error(f'Max retries reached. Connection failed..\n')
         return None, True
 
-    async def main():
+    async def main(dsn_name):
         global load_failed
         if not os.path.exists(config_file_path):
             logger.info(f" >> Config file does not exist in the path => {config_file_path}\n")
             return
         logger.info(f'Config file fetched from path => {config_file_path}\n')
         with open(config_file_path, 'r') as file:
-            config = yaml.safe_load(file)  
+            data_store_config = yaml.safe_load(file)  
         
-        dsn_name = config['qb_cred']['dsn_name']
-        server_name = config['qb_cred']['server_name']
-        
+        server_name = data_store_config['qb_cred']['server_name']
+        qb_path = data_store_config['qb_cred']['path_to_qb']
+        if not os.path.exists(qb_path):
+            logger.info(f" >> Quickbooks path does not exist in the path => {qb_path}\n")
+            return
 
         try: 
-            
-            connection, failed = await connect_to_qodbc(dsn_name)
+            logger.info(f" >> Connecting to Quickbooks with DSN: {dsn_name}\n")
+        
+            connection, failed = await connect_to_qodbc(qb_path, dsn_name)
             if failed :
                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
                 load_failed = True
                 return
-            cred = decode_bucket_cred(config['bucket_cred']['bucket_key'])
-            json_key = decode_bucket_cred(config['bucket_cred']['bucket_key'])
+            cred = decode_bucket_cred(data_store_config['bucket_cred']['bucket_key'])
+            json_key = decode_bucket_cred(data_store_config['bucket_cred']['bucket_key'])
             cred = json.loads(json_key)
             storage_options = {'service_account_key' : json.dumps(cred)}
             client = storage.Client.from_service_account_info(cred)
-            bucket_name = config['bucket_cred']['bucket_name']
-            orgid = config['bucket_cred']['orgid']
-            datasetid = config['bucket_cred']['datasetid']
+            bucket_name = data_store_config['bucket_cred']['bucket_name']
+            orgid = data_store_config['bucket_cred']['orgid']
+            datasetid = data_store_config['bucket_cred']['datasetid']
             bucket = client.bucket(bucket_name)
             base_path = f"gs://{bucket_name}/data/{orgid}/{datasetid}/parquet"
             excel_cred_path = f'{orgid}/{datasetid}/config/iconfig.yml'
@@ -454,8 +544,8 @@ try:
             ecred = ServiceAccountCredentials.from_json_keyfile_dict(ecred_key_dict,scopes=scope)
             eclient = gspread.authorize(ecred)
             Spreadsheet_name = config['excel_cred']['name']
-            worksheet_name = config['server_mapping'][server_name]
-            logger.info(f'>> Fetching QuickBooks data from server {server_name} \n')
+            worksheet_name = config['company_file_mapping'][dsn_name]
+            logger.info(f'>> Fetching QuickBooks data from server {server_name} for company file {dsn_name}\n')
             
             spreadsheet = eclient.open(Spreadsheet_name)
             load_config = spreadsheet.worksheet(worksheet_name)
@@ -584,6 +674,7 @@ try:
                 load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
                 load_config.update_cell(row_count,delta_version_column,version)
+                time.sleep(10)
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
@@ -608,7 +699,10 @@ try:
             asyncio.create_task(main())
         else:
             logger.info(f" >> Function started with a new event loop\n")
-            asyncio.run(main())
+            for dsn_name in dsn_names:
+                asyncio.run(main(dsn_name))
+                logger.info(f" >> Completed processing and logged out for DSN: {dsn_name} \n")
+                time.sleep(10)
 
 except Exception as e:
     logger.error(f" >> Encountered error \n{e}\n")
