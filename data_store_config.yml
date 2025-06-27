@@ -1,9 +1,9 @@
-qb_cred:                
-    dsn_name : 'QuickBooks Data'    # modify dsn from 'odbc data sources(64)'
-    server_name : # enter server name here
+qb_cred:   
+    path_to_qb : 'C:\Program Files\Intuit\QuickBooks Enterprise Solutions 24.0\QBW.EXE'  # modify path to your QuickBooks executable     
+    dsn_name :     # modify dsn from 'odbc data sources(64)'
+    server_name :  
 bucket_cred:
-    bucket_name :   # enter bucket name here
-    orgid :    # enter organization id here
-    datasetid :    # enter dataset id here
-    bucket_key :    # enter bucket key here
-    
+    bucket_name :  # enter bucket name here
+    orgid :   # enter organization id here
+    datasetid :   # enter dataset id here
+    bucket_key :   # enter bucket key here
