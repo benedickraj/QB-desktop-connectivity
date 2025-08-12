@@ -39,6 +39,10 @@ load_failed = False
 try:
 
     async def read_database(connection,query,table,itr_count):
+        """
+        Executes a database query asynchronously using the provided connection.
+        Returns the result dataframe and a retry flag.
+        """
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(dsn_connection, connection, query,table,itr_count), timeout= 600
@@ -49,8 +53,10 @@ try:
             return None,True
     
     def dsn_connection(run_connection, run_query,table,itr_count):
-        
-
+        """
+        Executes a SQL query using the provided pyodbc connection.
+        Returns the result dataframe and a retry flag.
+        """
         try:
             logger.info(f' >> Executing chunk {itr_count} for the table {table}-->\n')
             sql_query = run_query
@@ -63,7 +69,9 @@ try:
             return None,True
 
     def decode_bucket_cred(encoded_str):
-        
+        """
+        Decodes a base64-encoded string and returns the decoded string.
+        """
         try: 
             decoded_bytes = base64.b64decode(encoded_str)
             decoded_str = decoded_bytes.decode('utf-8')
@@ -72,8 +80,26 @@ try:
             logger.error(f" >> \t Error in decoding the bucket with key {encoded_str} : {str(e)}\n")
             return None     
      
+    def check_connection_status(connection):
+        """
+        Checks if the pyodbc connection is open.
+        Returns True if open, False otherwise.
+        """
+        try:
+            # pyodbc connection has a closed attribute: 0=open, 1=closed
+            if hasattr(connection, 'closed'):
+                return connection.closed == 0
+            else:
+                # If the connection object does not have 'closed' attribute, assume it's open
+                return True
+        except Exception:
+            return False
+    
     def split_query_by_month(query,type,current_date_flag):
-
+        """
+        Splits a query into monthly chunks based on date parameters.
+        Returns a list of queries for each month.
+        """
         try:
             excecute = 0
             if 'parameters' not in query.lower() and type.lower() == 'report':
@@ -200,7 +226,10 @@ try:
         
         
     def datatype_conversion(df,table_name):
-        
+        """
+        Converts dataframe column datatypes to appropriate formats for Deltalake.
+        Returns the converted dataframe.
+        """
         try:
             dtype = dict(df.schema)
             for cols in df.columns:
@@ -236,7 +265,10 @@ try:
             return None
      
     def load_data(df, primary_key, table_path, overwrite, load_type, storage_options):
-        
+        """
+        Loads the dataframe to Deltalake using the specified mode and options.
+        Returns a status dictionary indicating success or failure.
+        """
         try:
             if load_type.lower() == 'full':
                 if overwrite:
@@ -287,6 +319,9 @@ try:
             return {'status' : 'failed', 'message' : f'{str(e)}'}
     
     def setVersion(table_name,table_path,storage_options,backup_version):
+        """
+        Restores the DeltaTable to the specified backup version and returns the latest version.
+        """
         try:
             delta_table = DeltaTable(table_path , storage_options=storage_options)
             delta_table.restore(backup_version)
@@ -300,7 +335,10 @@ try:
         
 
     def email_process(load_failed, config_cred_path, file_path):
-        
+        """
+        Sends an email notification with the log file attached after data load.
+        Uploads the log file to the bucket and sends email based on configuration.
+        """
         result = ""
         config_file_path = config_cred_path
         with open(config_file_path, 'r') as file:
@@ -383,6 +421,10 @@ try:
             result = "Email sending failed:", str(e) 
 
     async def connect_to_qodbc(dsn_name, max_retries=3, timeout=600):
+        """
+        Asynchronously attempts to connect to QuickBooks via pyodbc.
+        Retries on failure up to max_retries. Returns connection and failure flag.
+        """
         retries = 0
         while retries < max_retries:
             try:
@@ -409,6 +451,10 @@ try:
         return None, True
 
     async def main():
+        """
+        Main function to orchestrate QuickBooks data extraction, transformation, and loading.
+        Handles configuration, connection, data processing, and logging.
+        """
         global load_failed
         if not os.path.exists(config_file_path):
             logger.info(f" >> Config file does not exist in the path => {config_file_path}\n")
@@ -539,7 +585,7 @@ try:
                         elif df.shape[0]==0:
                             connection.close()
                             logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt...Initiating the Quicbooks connection again\n")
-                            time.sleep(180)
+                            await asyncio.sleep(180)
                             enable_retry = True
                             connection, failed = await connect_to_qodbc(dsn_name)
                             if failed :
@@ -584,6 +630,14 @@ try:
                 load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
                 load_config.update_cell(row_count,delta_version_column,version)
+
+            if connection:
+                try:
+                    if check_connection_status(connection):
+                        connection.close()
+                        logger.info(" >> QODBC connection closed after data load.\n")
+                except Exception as e:
+                    logger.error(f" >> Error while closing connection: {e}\n")
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
