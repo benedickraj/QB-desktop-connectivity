@@ -467,9 +467,9 @@ try:
 
         receiver_emails = list(set(receiver_emails))
         if load_failed:
-            subject = f'{server_name} - Failed QuickBooks load' 
+            subject = f'Failed QuickBooks load from server {server_name}' 
         else:
-            subject = f"{server_name} - Successful QuickBooks load" 
+            subject = f"Successfull QuickBooks load from server {server_name}" 
         message = f"Hello,\n\n Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n Thanks,\n\n Team Conversight"  # change body here
 
         # Create a message object
