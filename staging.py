@@ -4,6 +4,7 @@ import polars as pl
 import yaml
 import os
 import re
+import psutil
 import base64, json
 from google.cloud import storage
 from pathlib import Path
@@ -49,6 +50,7 @@ try:
                 )
         except asyncio.TimeoutError:
             connection.close()
+            kill_quickbooks_process()
             logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
             return None,True
     
@@ -66,6 +68,7 @@ try:
         except Exception as e:
             logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
             run_connection.close()
+            kill_quickbooks_process()
             return None,True
 
     def decode_bucket_cred(encoded_str):
@@ -79,22 +82,26 @@ try:
         except Exception as e:
             logger.error(f" >> \t Error in decoding the bucket with key {encoded_str} : {str(e)}\n")
             return None     
-     
-    def check_connection_status(connection):
+    
+    def kill_quickbooks_process():
         """
-        Checks if the pyodbc connection is open.
-        Returns True if open, False otherwise.
+        Kills any running QuickBooks processes to avoid connection issues.
         """
         try:
-            # pyodbc connection has a closed attribute: 0=open, 1=closed
-            if hasattr(connection, 'closed'):
-                return connection.closed == 0
-            else:
-                # If the connection object does not have 'closed' attribute, assume it's open
-                return True
-        except Exception:
-            return False
-    
+            found = False
+            logger.info(f" >> Killed any running QuickBooks processes.\n")
+            for proc in psutil.process_iter(['pid', 'name']):
+                if proc.info['name'].lower() in ['qbw.exe', 'qbw32.exe']:
+                    logger.info(f" >> Killing process: {proc.info['name']} (PID: {proc.info['pid']})")
+                    found = True
+                    proc.terminate()
+                    proc.wait()
+            if found == False:
+                logger.info(f" >> No QuickBooks processes found to kill.\n")
+            
+        except Exception as e:
+            logger.error(f" >> Error in killing QuickBooks process: {str(e)}\n")
+
     def split_query_by_month(query,type,current_date_flag):
         """
         Splits a query into monthly chunks based on date parameters.
@@ -468,7 +475,7 @@ try:
         
 
         try: 
-            
+
             connection, failed = await connect_to_qodbc(dsn_name)
             if failed :
                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
@@ -632,24 +639,34 @@ try:
                 load_config.update_cell(row_count,delta_version_column,version)
 
             if connection:
-                try:
-                    if check_connection_status(connection):
-                        connection.close()
-                        logger.info(" >> QODBC connection closed after data load.\n")
-                except Exception as e:
-                    logger.error(f" >> Error while closing connection: {e}\n")
+                connection.close()
+                kill_quickbooks_process()
+                logger.info(" >> QODBC connection closed after data load.\n")
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
             load_failed = True
+            if connection:
+                connection.close()
+                kill_quickbooks_process()
+                logger.info(" >> QODBC connection closed after failure.\n")
             return
         except gspread.exceptions.WorksheetNotFound:
             logger.error(f'>> Worksheet "{worksheet_name}" not found in spreadsheet "{Spreadsheet_name}" \n')
             load_failed = True
+            if connection:
+                connection.close()
+                kill_quickbooks_process()
+                logger.info(" >> QODBC connection closed after failure.\n")
             return
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
+            if connection:
+                connection.close()
+                kill_quickbooks_process()
+                logger.info(" >> QODBC connection closed after failure.\n")
             return
+        
         
     if __name__ == "__main__":
         try:
