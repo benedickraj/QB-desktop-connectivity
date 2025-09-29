@@ -50,7 +50,6 @@ try:
                 )
         except asyncio.TimeoutError:
             connection.close()
-            kill_quickbooks_process()
             logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
             return None,True
     
@@ -68,7 +67,6 @@ try:
         except Exception as e:
             logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
             run_connection.close()
-            kill_quickbooks_process()
             return None,True
 
     def decode_bucket_cred(encoded_str):
@@ -455,6 +453,7 @@ try:
                 return None, True 
              
         logger.error(f'Max retries reached. Connection failed..\n')
+        kill_quickbooks_process()
         return None, True
 
     async def main():
@@ -640,31 +639,32 @@ try:
 
             if connection:
                 connection.close()
-                kill_quickbooks_process()
                 logger.info(" >> QODBC connection closed after data load.\n")
+            
+            kill_quickbooks_process()
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
             load_failed = True
             if connection:
                 connection.close()
-                kill_quickbooks_process()
                 logger.info(" >> QODBC connection closed after failure.\n")
+            kill_quickbooks_process()
             return
         except gspread.exceptions.WorksheetNotFound:
             logger.error(f'>> Worksheet "{worksheet_name}" not found in spreadsheet "{Spreadsheet_name}" \n')
             load_failed = True
             if connection:
                 connection.close()
-                kill_quickbooks_process()
                 logger.info(" >> QODBC connection closed after failure.\n")
+            kill_quickbooks_process()
             return
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
             if connection:
                 connection.close()
-                kill_quickbooks_process()
                 logger.info(" >> QODBC connection closed after failure.\n")
+            kill_quickbooks_process()
             return
         
         
