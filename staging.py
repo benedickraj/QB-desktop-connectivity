@@ -1,4 +1,5 @@
 import logging
+import subprocess
 import pyodbc
 import polars as pl
 import yaml
@@ -83,22 +84,76 @@ try:
     
     def kill_quickbooks_process():
         """
-        Kills any running QuickBooks processes to avoid connection issues.
+        Find and kill any running QuickBooks processes.
+
+        Returns:
+            List[dict]: A list of dicts describing the killed processes. Each dict
+            contains 'name' and 'exe' keys. If nothing was found or an error
+            occurred an empty list is returned.
         """
         try:
-            found = False
-            logger.info(f" >> Killed any running QuickBooks processes.\n")
-            for proc in psutil.process_iter(['pid', 'name']):
-                if proc.info['name'].lower() in ['qbw.exe', 'qbw32.exe']:
-                    logger.info(f" >> Killing process: {proc.info['name']} (PID: {proc.info['pid']})")
-                    found = True
-                    proc.terminate()
-                    proc.wait()
-            if found == False:
+            qb_processes = []
+            logger.info(f" >> Looking for QuickBooks processes.\n")
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    pname = (proc.info.get('name') or '').lower()
+                except Exception:
+                    # proc.info access can fail for system/privileged processes
+                    continue
+
+                if pname in ['qbw.exe', 'qbw32.exe']:
+                    logger.info(f" >> Found process: {proc.info.get('name')} (PID: {proc.info.get('pid')})")
+                    qb_processes.append({
+                        'name': proc.info.get('name'),
+                        'exe': proc.info.get('exe')
+                    })
+                    try:
+                        proc.terminate()
+                        proc.wait()
+                    except Exception as e:
+                        logger.error(f" >> Error terminating process {proc.pid if hasattr(proc,'pid') else '?'}: {str(e)}\n")
+
+            if qb_processes:
+                logger.info(f" >> Killed {len(qb_processes)} QuickBooks process(es).\n")
+            else:
                 logger.info(f" >> No QuickBooks processes found to kill.\n")
-            
+
+            return qb_processes
+
         except Exception as e:
             logger.error(f" >> Error in killing QuickBooks process: {str(e)}\n")
+            return []
+
+    def relaunch_quickbooks_processes(qb_processes, delay_seconds=60):
+        """
+        Relaunch QuickBooks processes from a list produced by
+        `kill_quickbooks_process`.
+
+        Args:
+            qb_processes (list): List of dicts with 'name' and 'exe' keys.
+            delay_seconds (int): Seconds to wait before attempting relaunch.
+        """
+        try:
+            if not qb_processes:
+                logger.info(" >> No QuickBooks processes to relaunch.\n")
+                return
+
+            logger.info(f" >> Waiting {delay_seconds} second(s) before relaunch...\n")
+            time.sleep(delay_seconds)
+
+            for qb in qb_processes:
+                try:
+                    exe_path = qb.get('exe')
+                    if exe_path:
+                        subprocess.Popen([exe_path])
+                        logger.info(f" >> Relaunched QuickBooks process: {qb.get('name')}\n")
+                    else:
+                        logger.warning(f" >> No executable path for process {qb.get('name')}; cannot relaunch.\n")
+                except Exception as e:
+                    logger.error(f" >> Error relaunching QuickBooks process {qb.get('name')}: {str(e)}\n")
+
+        except Exception as e:
+            logger.error(f" >> Error in relaunching QuickBooks processes: {str(e)}\n")
 
     def split_query_by_month(query,type,current_date_flag):
         """
@@ -329,14 +384,18 @@ try:
         """
         try:
             delta_table = DeltaTable(table_path , storage_options=storage_options)
+            latest_version = delta_table.history()[0]
+            if latest_version['version'] == backup_version:
+                logger.info(f" >> The table {table_name} is already in the backup version => {backup_version}\n")
+                return latest_version['version']
             delta_table.restore(backup_version)
             latest_version = delta_table.history()[0]
-            logger.info(f"Updating the latest version for the table {table_name} to => {latest_version['version']}")
+            logger.info(f" >> Restored the table {table_name} to the backup version => {backup_version}\n")
             return latest_version['version']
         
         except Exception as e:
-            logger.error(f'Error in getting version for the table {table_name} => {str(e)}\n')
-            return 
+            logger.error(f' >> Error in getting version for the table {table_name} => {str(e)}\n')
+            return backup_version 
         
 
     def email_process(load_failed, config_cred_path, file_path):
@@ -453,7 +512,8 @@ try:
                 return None, True 
              
         logger.error(f'Max retries reached. Connection failed..\n')
-        kill_quickbooks_process()
+        qb_procs = kill_quickbooks_process()
+        relaunch_quickbooks_processes(qb_procs)
         return None, True
 
     async def main():
@@ -467,8 +527,13 @@ try:
             return
         logger.info(f'Config file fetched from path => {config_file_path}\n')
         with open(config_file_path, 'r') as file:
-            config = yaml.safe_load(file)  
-        
+            config = yaml.safe_load(file)
+
+        # Kill any existing QuickBooks instances before attempting connection or data load.
+        # We capture the list of killed processes (name + exe path) so we can relaunch them
+        # at the end of the run or on failure.
+        qb_procs = kill_quickbooks_process()
+
         dsn_name = config['qb_cred']['dsn_name']
         server_name = config['qb_cred']['server_name']
         
@@ -640,8 +705,10 @@ try:
             if connection:
                 connection.close()
                 logger.info(" >> QODBC connection closed after data load.\n")
-            
-            kill_quickbooks_process()
+
+            # Relaunch any QuickBooks processes that were present before the run
+            qb_procs = kill_quickbooks_process()
+            relaunch_quickbooks_processes(qb_procs)
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
@@ -649,7 +716,8 @@ try:
             if connection:
                 connection.close()
                 logger.info(" >> QODBC connection closed after failure.\n")
-            kill_quickbooks_process()
+            qb_procs = kill_quickbooks_process()
+            relaunch_quickbooks_processes(qb_procs)
             return
         except gspread.exceptions.WorksheetNotFound:
             logger.error(f'>> Worksheet "{worksheet_name}" not found in spreadsheet "{Spreadsheet_name}" \n')
@@ -657,14 +725,16 @@ try:
             if connection:
                 connection.close()
                 logger.info(" >> QODBC connection closed after failure.\n")
-            kill_quickbooks_process()
+            qb_procs = kill_quickbooks_process()
+            relaunch_quickbooks_processes(qb_procs)
             return
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
             if connection:
                 connection.close()
                 logger.info(" >> QODBC connection closed after failure.\n")
-            kill_quickbooks_process()
+            qb_procs = kill_quickbooks_process()
+            relaunch_quickbooks_processes(qb_procs)
             return
         
         
