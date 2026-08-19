@@ -7,3 +7,5 @@ bucket_cred:
     orgid :   # enter organization id here
     datasetid :   # enter dataset id here
     bucket_key :   # enter bucket key here
+initial_load:   # one entry per dsn; True before that company file's first run, the script flips it to False afterwards
+    # 'DSN_NAME' : True

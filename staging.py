@@ -4,6 +4,7 @@ import polars as pl
 import yaml
 import os
 import re
+import psutil
 import base64, json
 from google.cloud import storage
 from pathlib import Path
@@ -30,20 +31,47 @@ log_filename = f'log_{timestamp}.txt'
 log_filepath = os.path.join(log_dir, log_filename)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+class DsnContextFilter(logging.Filter):
+    """
+    Tags every log record with the company file (DSN) being processed, so the
+    lines stay attributable when several company files run in one log file.
+    Set DsnContextFilter.current_dsn before processing each company file.
+    """
+    current_dsn = ''
+
+    def filter(self, record):
+        record.dsn = f'[{DsnContextFilter.current_dsn}] ' if DsnContextFilter.current_dsn else ''
+        return True
+
+
+log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(dsn)s%(message)s')
 file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+file_handler.setFormatter(log_format)
 logger.addHandler(file_handler)
 console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+console_handler.setFormatter(log_format)
 logger.addHandler(console_handler)
+logger.addFilter(DsnContextFilter())
 load_failed = False
+# Per company file outcome for this run, in the order the DSNs are processed.
+# Filled in by main() and summarised in the notification email.
+dsn_status = {}
+run_started_at = datetime.now()
 
-with open(config_file_path, 'r') as file:
-    config = yaml.safe_load(file)  
-        
-dsn_names = [dsn.strip() for dsn in config['qb_cred']['dsn_name'].split(',')]
+config = {}
+dsn_names = []
 
 try:
+
+    # Read inside the try so a missing/invalid config still reaches the mail step below
+    with open(config_file_path, 'r') as file:
+        config = yaml.safe_load(file) or {}
+
+    dsn_names = [dsn.strip() for dsn in str(config['qb_cred']['dsn_name']).split(',') if dsn.strip()]
+    if not dsn_names:
+        raise ValueError(f"No dsn_name configured in {config_file_path}")
 
     async def read_database(connection,query,table,itr_count):
         """
@@ -84,8 +112,10 @@ try:
             decoded_str = decoded_bytes.decode('utf-8')
             return decoded_str
         except Exception as e:
-            logger.error(f" >> \t Error in decoding the bucket with key {encoded_str} : {str(e)}\n")
-            return None     
+            # The encoded value is a service account key - never write it to the log,
+            # the log is emailed out and uploaded to the bucket.
+            logger.error(f" >> \t Error in decoding the base64 credential : {str(e)}\n")
+            return None
      
     def is_quickbooks_running():
         """
@@ -93,12 +123,102 @@ try:
         Returns True if running, False otherwise.
         """
         try:
-            output = subprocess.check_output('tasklist', shell=True).decode()
-            return 'QBW.EXE' in output
+            for proc in psutil.process_iter(['name']):
+                try:
+                    if (proc.info.get('name') or '').lower() in ['qbw.exe', 'qbw32.exe']:
+                        return True
+                except Exception:
+                    continue
+            return False
         except Exception as e:
-            logger.error("Error checking task list:", e)
+            logger.error(f" >> Error while checking for a running QuickBooks process: {str(e)}\n")
             return False
     
+    def kill_quickbooks_process():
+        """
+        Find and kill any running QuickBooks processes.
+
+        Returns:
+            List[dict]: A list of dicts describing the killed processes. Each dict
+            contains 'name' and 'exe' keys. If nothing was found or an error
+            occurred an empty list is returned.
+        """
+        try:
+            qb_processes = []
+            logger.info(f" >> Looking for QuickBooks processes.\n")
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    pname = (proc.info.get('name') or '').lower()
+                except Exception:
+                    # proc.info access can fail for system/privileged processes
+                    continue
+
+                if pname in ['qbw.exe', 'qbw32.exe']:
+                    logger.info(f" >> Found process: {proc.info.get('name')} (PID: {proc.info.get('pid')})")
+                    qb_processes.append({
+                        'name': proc.info.get('name'),
+                        'exe': proc.info.get('exe')
+                    })
+                    try:
+                        proc.terminate()
+                        proc.wait()
+                    except Exception as e:
+                        logger.error(f" >> Error terminating process {proc.pid if hasattr(proc,'pid') else '?'}: {str(e)}\n")
+
+            if qb_processes:
+                logger.info(f" >> Killed {len(qb_processes)} QuickBooks process(es).\n")
+            else:
+                logger.info(f" >> No QuickBooks processes found to kill.\n")
+
+            return qb_processes
+
+        except Exception as e:
+            logger.error(f" >> Error in killing QuickBooks process: {str(e)}\n")
+            return []
+
+    def relaunch_quickbooks_processes(qb_processes, qb_path=None, delay_seconds=60):
+        """
+        Relaunch QuickBooks processes from a list produced by
+        `kill_quickbooks_process`.
+
+        Args:
+            qb_processes (list): List of dicts with 'name' and 'exe' keys.
+            qb_path (str): Executable to fall back on when psutil could not read
+                the exe path of the killed process.
+            delay_seconds (int): Seconds to wait before attempting relaunch.
+        """
+        try:
+            if not qb_processes:
+                logger.info(" >> No QuickBooks processes to relaunch.\n")
+                return
+
+            logger.info(f" >> Waiting {delay_seconds} second(s) before relaunch...\n")
+            time.sleep(delay_seconds)
+
+            for qb in qb_processes:
+                try:
+                    exe_path = qb.get('exe') or qb_path
+                    if exe_path:
+                        subprocess.Popen([exe_path])
+                        logger.info(f" >> Relaunched QuickBooks process: {qb.get('name')}\n")
+                    else:
+                        logger.warning(f" >> No executable path for process {qb.get('name')}; cannot relaunch.\n")
+                except Exception as e:
+                    logger.error(f" >> Error relaunching QuickBooks process {qb.get('name')}: {str(e)}\n")
+
+        except Exception as e:
+            logger.error(f" >> Error in relaunching QuickBooks processes: {str(e)}\n")
+
+    def restart_quickbooks(qb_path=None):
+        """
+        Force restart of QuickBooks: kill every running instance and bring the
+        same executables back up. Used as the recovery step for connection
+        failures that a graceful logout could not resolve.
+        """
+        qb_processes = kill_quickbooks_process()
+        relaunch_quickbooks_processes(qb_processes, qb_path)
+        return qb_processes
+
     def logout_quickbooks(qb_path):
         """
         Logs out of QuickBooks by automating the UI to close the company/log off.
@@ -182,7 +302,20 @@ try:
                 return True
         except Exception:
             return False
-        
+
+    def close_connection(connection, context):
+        """
+        Closes the QODBC connection if it is still open. Safe to call with None.
+        """
+        if not connection:
+            return
+        try:
+            if check_connection_status(connection):
+                connection.close()
+                logger.info(f" >> QODBC connection closed after {context}.\n")
+        except Exception as e:
+            logger.error(f" >> Error while closing connection: {e}\n")
+
     def split_query_by_month(query,type,current_date_flag):
         """
         Splits a query into monthly chunks based on date parameters.
@@ -412,15 +545,19 @@ try:
         """
         try:
             delta_table = DeltaTable(table_path , storage_options=storage_options)
+            latest_version = delta_table.history()[0]
+            if latest_version['version'] == backup_version:
+                logger.info(f" >> The table {table_name} is already in the backup version => {backup_version}\n")
+                return latest_version['version']
             delta_table.restore(backup_version)
             latest_version = delta_table.history()[0]
-            logger.info(f"Updating the latest version for the table {table_name} to => {latest_version['version']}")
+            logger.info(f" >> Restored the table {table_name} to the backup version => {backup_version}\n")
             return latest_version['version']
-        
+
         except Exception as e:
-            logger.error(f'Error in getting version for the table {table_name} => {str(e)}\n')
-            return 
-        
+            logger.error(f' >> Error in getting version for the table {table_name} => {str(e)}\n')
+            return backup_version
+
 
     def email_process(load_failed, config_cred_path, file_path):
         """
@@ -431,17 +568,15 @@ try:
         config_file_path = config_cred_path
         with open(config_file_path, 'r') as file:
             config = yaml.safe_load(file) 
-        cred=decode_bucket_cred(config['bucket_cred']['bucket_key'])
+        # bucket_cred is only used to fetch iconfig.yml
         json_key = decode_bucket_cred(config['bucket_cred']['bucket_key'])
         cred = json.loads(json_key)
-        storage_options = {'service_account_key' : json.dumps(cred)}
         client = storage.Client.from_service_account_info(cred)
         server_name = config['qb_cred']['server_name']
         bucket_name=config['bucket_cred']['bucket_name']
         orgid=config['bucket_cred']['orgid']
         datasetid = config['bucket_cred']['datasetid']
         bucket = client.bucket(bucket_name)
-        base_path=f"gs://{bucket_name}/data/{orgid}/{datasetid}/parquet"
         excel_cred_path = f'{orgid}/{datasetid}/config/iconfig.yml'
         blob = bucket.blob(excel_cred_path)
         yaml_data = blob.download_as_bytes()
@@ -449,11 +584,18 @@ try:
         credential = config['mail_cred']
         send_mail_if_success = True if config['send_mail_for_all_success'] == 'True' else False
 
-        # Upload log file to bucket
-        log_path_in_bucket = f'{orgid}/{datasetid}/quickbooks_log/{log_filename}'
-        log_blob = bucket.blob(log_path_in_bucket)
-        log_blob.upload_from_filename(file_path)
-        logger.info('>> Log file uploaded to bucket.\n')
+        # Upload log file to the target bucket, using the credentials from iconfig
+        try:
+            ecred_key_dict = json.loads(decode_bucket_cred(config['excel_cred']['key']))
+            target_bucket_name = config['target_bucket_name']
+            log_client = storage.Client.from_service_account_info(ecred_key_dict)
+            log_bucket = log_client.bucket(target_bucket_name)
+            log_path_in_bucket = f'{orgid}/{datasetid}/quickbooks_log/{log_filename}'
+            log_blob = log_bucket.blob(log_path_in_bucket)
+            log_blob.upload_from_filename(file_path)
+            logger.info(f'>> Log file uploaded to gs://{target_bucket_name}/{log_path_in_bucket}\n')
+        except Exception as e:
+            logger.error(f'>> Failed to upload the log file to the target bucket: {str(e)}\n')
         
         
         # Email configuration
@@ -466,11 +608,32 @@ try:
 
 
         receiver_emails = list(set(receiver_emails))
-        if load_failed:
-            subject = f'Failed QuickBooks load from server {server_name}' 
+
+        succeeded = [name for name, status in dsn_status.items() if str(status).startswith('Success')]
+        failed = [name for name, status in dsn_status.items() if not str(status).startswith('Success')]
+
+        if not dsn_status:
+            # The run did not get as far as processing a single company file
+            subject = f'Failed QuickBooks load from server {server_name} - no company file was processed'
+        elif failed:
+            named = ', '.join(failed[:3]) + (f' and {len(failed) - 3} more' if len(failed) > 3 else '')
+            subject = f'Failed QuickBooks load from server {server_name} - {len(succeeded)} succeeded, {len(failed)} failed ({named})'
         else:
-            subject = f"Successfull QuickBooks load from server {server_name}" 
-        message = f"Hello,\n\n Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n Thanks,\n\n Team Conversight"  # change body here
+            subject = f'Successfull QuickBooks load from server {server_name} - {len(succeeded)} company file(s) loaded'
+
+        elapsed = datetime.now() - run_started_at
+        status_lines = '\n'.join(f'   {name} : {status}' for name, status in dsn_status.items()) or '   (no company file was processed)'
+        message = (
+            f"Hello,\n\n"
+            f" Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n"
+            f" Server        : {server_name}\n"
+            f" Started       : {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f" Finished      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (took {elapsed})\n"
+            f" Company files : {len(dsn_status)} processed, {len(succeeded)} succeeded, {len(failed)} failed\n\n"
+            f" Status per company file:\n{status_lines}\n\n"
+            f" Log file      : {log_filename}\n\n"
+            f" Thanks,\n\n Team Conversight"
+        )
 
         # Create a message object
         msg = MIMEMultipart()
@@ -512,8 +675,13 @@ try:
         """
         Asynchronously attempts to connect to QuickBooks via pyodbc.
         Retries on failure up to max_retries. Returns connection and failure flag.
+
+        When QuickBooks reports 8004040A (a different company file is already
+        open) the recovery escalates: first a graceful UI logout, and only if
+        that does not release the file a forced restart of QuickBooks.
         """
         retries = 0
+        logout_attempts = 0
         while retries < max_retries:
             try:
                 connection = await asyncio.wait_for(
@@ -531,18 +699,86 @@ try:
                 retries += 1
                 error_message = str(e1)
                 logger.info(f'>> Error in Initialing Quickbooks => {error_message}\n')
-                if '8004040a' in error_message:
-                    logger.info('QuickBooks is already logged in with another file. Logging out...\n')
-                    logout_quickbooks(qb_path)
+                if '8004040a' in error_message.lower():
+                    logout_attempts += 1
+                    if logout_attempts <= 1:
+                        logger.info(f'Attempt {retries}: QuickBooks is already logged in with another company file. Logging out...\n')
+                        logout_quickbooks(qb_path)
+                        await asyncio.sleep(30)
+                    else:
+                        logger.info(f'Attempt {retries}: Graceful logout did not release the company file. Restarting QuickBooks...\n')
+                        restart_quickbooks(qb_path)
                 else:
                     logger.info(f"Attempt {retries}: unable to connect quickbooks through pyodbc..Retrying in 5 minutes...")
-                    await asyncio.sleep(300) 
+                    await asyncio.sleep(300)
             except Exception as e:
                 logger.error(f'Unexpected error while Quickbooks connection => {e}\n')
-                return None, True 
-             
+                return None, True
+
         logger.error(f'Max retries reached. Connection failed..\n')
+        restart_quickbooks(qb_path)
         return None, True
+
+    def consume_initial_load_flag(dsn_name):
+        """
+        Returns the `initial_load` flag of a single company file (DSN) and marks
+        that company file as loaded, so only its first ever run is treated as the
+        initial load. A DSN that is not listed yet defaults to True.
+
+        `initial_load` is a mapping in the config file:
+
+            initial_load:
+                'DSN_ONE' : True
+                'DSN_TWO' : True
+
+        The file is rewritten line by line so the template comments survive.
+        """
+        try:
+            with open(config_file_path, 'r') as file:
+                initial_load = (yaml.safe_load(file) or {}).get('initial_load') or {}
+            if not isinstance(initial_load, dict):
+                logger.warning(f" >> initial_load in the config file is not a mapping; treating {dsn_name} as an initial load.\n")
+                initial_load = {}
+            flag = initial_load.get(dsn_name, True)
+
+            with open(config_file_path, 'r') as file:
+                lines = file.readlines()
+
+            entry = f"    '{dsn_name}' : False\n"
+            block_start = None
+            for idx, line in enumerate(lines):
+                if re.match(r'^\s*initial_load\s*:', line):
+                    block_start = idx
+                    break
+
+            if block_start is None:
+                # No initial_load section yet - start one at the end of the file
+                if lines and not lines[-1].endswith('\n'):
+                    lines[-1] = lines[-1] + '\n'
+                lines.append('initial_load:\n')
+                lines.append(entry)
+            else:
+                # Walk the indented entries of the section looking for this DSN
+                dsn_pattern = re.compile(rf"^\s+['\"]?{re.escape(dsn_name)}['\"]?\s*:")
+                idx = block_start + 1
+                updated = False
+                while idx < len(lines) and (lines[idx].startswith((' ', '\t')) or not lines[idx].strip()):
+                    if dsn_pattern.match(lines[idx]):
+                        lines[idx] = entry
+                        updated = True
+                        break
+                    idx += 1
+                if not updated:
+                    lines.insert(block_start + 1, entry)
+
+            with open(config_file_path, 'w') as f:
+                f.writelines(lines)
+
+            return flag
+
+        except Exception as e:
+            logger.error(f" >> Error while reading/updating the initial_load flag for {dsn_name}: {str(e)}\n")
+            return True
 
     async def main(dsn_name):
         """
@@ -552,35 +788,54 @@ try:
         global load_failed
         if not os.path.exists(config_file_path):
             logger.info(f" >> Config file does not exist in the path => {config_file_path}\n")
+            load_failed = True
+            dsn_status[dsn_name] = 'Failed - config file not found'
             return
         logger.info(f'Config file fetched from path => {config_file_path}\n')
         with open(config_file_path, 'r') as file:
-            data_store_config = yaml.safe_load(file)  
-        
+            data_store_config = yaml.safe_load(file)
+
         server_name = data_store_config['qb_cred']['server_name']
         qb_path = data_store_config['qb_cred']['path_to_qb']
         if not os.path.exists(qb_path):
             logger.info(f" >> Quickbooks path does not exist in the path => {qb_path}\n")
+            load_failed = True
+            dsn_status[dsn_name] = 'Failed - QuickBooks path not found'
             return
 
-        try: 
+        # The first time a company file is loaded QuickBooks was not started by this
+        # script, so leave whatever the user has open alone and let the graceful
+        # logout in connect_to_qodbc release it. From the second run of the same
+        # company file onwards, clear out what the previous run left behind.
+        if consume_initial_load_flag(dsn_name):
+            logger.info(f" >> Initial load for {dsn_name}: skipping the QuickBooks cleanup before connecting.\n")
+        else:
+            kill_quickbooks_process()
+
+        connection = None
+        Spreadsheet_name = None
+        worksheet_name = None
+        failed_tables = []
+        tables_processed = 0
+        dsn_rows = 0
+
+        try:
             logger.info(f" >> Connecting to Quickbooks with DSN: {dsn_name}\n")
-        
+
             connection, failed = await connect_to_qodbc(qb_path, dsn_name)
             if failed :
                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
                 load_failed = True
+                dsn_status[dsn_name] = 'Failed - could not connect to QuickBooks'
                 return
-            cred = decode_bucket_cred(data_store_config['bucket_cred']['bucket_key'])
+            # bucket_cred is only used to fetch iconfig.yml
             json_key = decode_bucket_cred(data_store_config['bucket_cred']['bucket_key'])
             cred = json.loads(json_key)
-            storage_options = {'service_account_key' : json.dumps(cred)}
             client = storage.Client.from_service_account_info(cred)
             bucket_name = data_store_config['bucket_cred']['bucket_name']
             orgid = data_store_config['bucket_cred']['orgid']
             datasetid = data_store_config['bucket_cred']['datasetid']
             bucket = client.bucket(bucket_name)
-            base_path = f"gs://{bucket_name}/data/{orgid}/{datasetid}/parquet"
             excel_cred_path = f'{orgid}/{datasetid}/config/iconfig.yml'
             blob = bucket.blob(excel_cred_path)
             yaml_data = blob.download_as_bytes()
@@ -596,6 +851,10 @@ try:
                     'https://www.googleapis.com/auth/drive']
             ecred = ServiceAccountCredentials.from_json_keyfile_dict(ecred_key_dict,scopes=scope)
             eclient = gspread.authorize(ecred)
+
+            # The same iconfig credentials own the Deltalake tables and the target bucket
+            storage_options = {'service_account_key' : json.dumps(ecred_key_dict)}
+            target_bucket_name = config['target_bucket_name']
             Spreadsheet_name = config['excel_cred']['name']
             worksheet_name = config['company_file_mapping'][dsn_name]
             logger.info(f'>> Fetching QuickBooks data from server {server_name} for company file {dsn_name}\n')
@@ -615,20 +874,42 @@ try:
                 load_start_time = row[config_df.columns.index('Start_Datetime')].strip()
                 row_count = table_idx.index(table_name) + 2
                 run_status_column = config_df.columns.index('Run_Status')+1
+                table_count_column = config_df.columns.index('Table_Count')+1 if 'Table_Count' in config_df.columns else None
                 delta_version_column = config_df.columns.index('Delta_version')+1
                 start_date_column = config_df.columns.index('Start_Datetime')+1
                 audit_column = row[config_df.columns.index('Audit_Column')].strip()
                 backup_version = row[config_df.columns.index('Delta_version')]
-                current_date_flag=row[config_df.columns.index('Current_Date_Flag')]
+                current_date_flag = str(row[config_df.columns.index('Current_Date_Flag')]).strip()
+                target_path = str(row[config_df.columns.index('Target_Path')]).strip() if 'Target_Path' in config_df.columns else ''
 
-                if backup_version == '':
+                # Target_Path holds the bucket-relative folder the table is written to,
+                # e.g. "data/leader-95fc/6a328272-rlcZtp-vm/delta/". There is no default.
+                tables_processed += 1
+                table_failed = False
+                table_rows = 0
+
+                if not target_path:
+                    logger.error(f" >> No Target_Path configured for {table_name}; skipping this table\n")
+                    load_failed = True
+                    failed_tables.append(table_name)
+                    load_config.update_cell(row_count,run_status_column,'Failed - no Target_Path')
+                    continue
+
+                try:
+                    backup_version = -1 if str(backup_version).strip() == '' else int(backup_version)
+                except (TypeError, ValueError):
+                    logger.warning(f" >> Delta_version for {table_name} is not a number ({backup_version!r}); treating it as -1\n")
                     backup_version = -1
-                version = int(backup_version)
+                version = backup_version
 
                 load_config.update_cell(row_count,run_status_column,'Running')
 
                 overwrite = True
-                table_path =  f"{base_path}/{table_name}"
+                if target_path.startswith('gs://'):
+                    table_path = f"{target_path.rstrip('/')}/{table_name}"
+                else:
+                    table_path = f"gs://{target_bucket_name}/{target_path.strip('/')}/{table_name}"
+                logger.info(f" >> {table_name} [{load_type}/{table_type}] will be written to {table_path}\n")
 
                 if load_type.lower() == 'delta' and table_type.lower() == 'table':
                     start_date = datetime.strptime(load_start_time, "%Y-%m-%d %H:%M:%S")
@@ -640,8 +921,15 @@ try:
                     else:
                         source_query = source_query + f" where {table_name}.{audit_column} between {{ts'{start_date}'}} and {{ts'{currenttime.strftime('%Y-%m-%d %H:%M:%S.%f')}'}}"
 
-                load_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-                query_list = split_query_by_month(source_query, table_type,current_date_flag) 
+                load_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                query_list = split_query_by_month(source_query, table_type,current_date_flag)
+                if not query_list:
+                    # split_query_by_month returns None when it cannot chunk the query
+                    logger.error(f" >> Could not build the query chunks for {table_name} (check Source_Query_Type / Current_Date_Flag); skipping this table\n")
+                    load_failed = True
+                    failed_tables.append(table_name)
+                    load_config.update_cell(row_count,run_status_column,'Failed - could not parse the query')
+                    continue
                 total_chunks = len(query_list)
                 retry_times = 3
                 logger.info(f">> Processing {table_name}: {total_chunks} chunk(s) identified\n")     
@@ -654,22 +942,24 @@ try:
                     if brk_toggle:
                         break
 
-                    itr_count=i    
+                    itr_count=i
                     executions = 1
                     enable_retry = True
                     itr_toggle = True
-                    
+                    chunk_empty = False
+
                     while executions <= retry_times and enable_retry:
                         df, enable_retry = await read_database(connection,query,table_name,itr_count) 
 
                         if df is None and enable_retry:
                             logger.info(f">> Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
                             enable_retry = True
-                            connection, failed = await connect_to_qodbc(dsn_name)
+                            connection, failed = await connect_to_qodbc(qb_path, dsn_name)
                             if failed :
                                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
                                 logger.info(f" >> Failed to load {table_name}. Updating the delta table to the backup version {backup_version}")
-                                load_config.update_cell(row_count,run_status_column,'Failed')  
+                                load_config.update_cell(row_count,run_status_column,'Failed')
+                                table_failed = True
                                 upd_version = setVersion(table_name,table_path,storage_options,backup_version)
                                 load_config.update_cell(row_count,delta_version_column,upd_version)
                                 break
@@ -680,23 +970,26 @@ try:
                             break
 
                         elif df.shape[0]==0:
+                            chunk_empty = True
                             connection.close()
                             logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt...Initiating the Quicbooks connection again\n")
                             await asyncio.sleep(180)
                             enable_retry = True
-                            connection, failed = await connect_to_qodbc(dsn_name)
+                            connection, failed = await connect_to_qodbc(qb_path, dsn_name)
                             if failed :
                                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
                                 logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
-                                load_config.update_cell(row_count,run_status_column,'Failed')  
+                                load_config.update_cell(row_count,run_status_column,'Failed')
+                                table_failed = True
                                 upd_version=setVersion(table_name,table_path,storage_options,backup_version)
                                 load_config.update_cell(row_count,delta_version_column,upd_version)
                                 brk_toggle = True
                                 break
                             
 
-                        else :    
-                            
+                        else :
+
+                            chunk_empty = False
                             logger.info(f">> Data successfully retrieved for table {table_name} with count {df.shape}\n")
                             res = load_data(df,primary_columns,table_path,overwrite,load_type,storage_options)
                             if res['status'] == 'success' and itr_count == total_chunks:
@@ -704,6 +997,13 @@ try:
                                 itr_toggle = False
                             if res['status'] == 'success':
                                 version = version + 1
+                                table_rows = table_rows + df.shape[0]
+                                # Only a write that actually landed consumes the overwrite;
+                                # otherwise the next chunk would append onto stale data.
+                                overwrite = False
+                            else:
+                                logger.error(f" >> Chunk {itr_count} of {table_name} was read but not written to {table_path} => {res['message']}\n")
+                                table_failed = True
                                 
 
                         executions = executions + 1 
@@ -712,58 +1012,104 @@ try:
                             logger.info(f" >> Maximum retries reached for the query {query}\n")
                             load_failed = True
                             logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
-                            load_config.update_cell(row_count,run_status_column,'Failed')  
+                            load_config.update_cell(row_count,run_status_column,'Failed')
+                            table_failed = True
                             upd_version=setVersion(table_name,table_path,storage_options,backup_version)
                             version = upd_version
                             load_config.update_cell(row_count,delta_version_column,upd_version)
                             brk_toggle = True
                             break
 
-                        if itr_count == total_chunks and itr_toggle:
+                        if itr_count == total_chunks and itr_toggle and not chunk_empty:
                             load_config.update_cell(row_count,run_status_column,"Last chunk completed but not uploaded to delta")
 
-                    overwrite = False 
+                    if chunk_empty and not table_failed:
+                        # Nothing to load for this period - a normal outcome for an
+                        # incremental load, so it is a success and not a failure.
+                        logger.info(f" >> Chunk {itr_count} of {table_name} returned no rows after {retry_times} attempt(s); nothing to load for this period\n")
+                        if itr_count == total_chunks and itr_toggle:
+                            load_config.update_cell(row_count,run_status_column,'Success')
+                            itr_toggle = False
 
-                load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+                load_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 load_config.update_cell(row_count, start_date_column+1, load_end_time)
                 load_config.update_cell(row_count,delta_version_column,version)
+
+                if table_count_column:
+                    load_config.update_cell(row_count, table_count_column, table_rows)
+                dsn_rows += table_rows
+
+                if table_failed:
+                    load_failed = True
+                    failed_tables.append(table_name)
+                    logger.error(f" >> {table_name} finished with errors ({table_rows:,} row(s) loaded)\n")
+                else:
+                    logger.info(f" >> {table_name} finished successfully with {table_rows:,} row(s)\n")
+
                 await asyncio.sleep(10)
 
-            if connection:
-                try:
-                    if check_connection_status(connection):
-                        connection.close()
-                        logger.info(" >> QODBC connection closed after data load.\n")
-                except Exception as e:
-                    logger.error(f" >> Error while closing connection: {e}\n")
+            if failed_tables:
+                dsn_status[dsn_name] = f"Failed - {len(failed_tables)} of {tables_processed} table(s) failed: {', '.join(failed_tables)} ({dsn_rows:,} row(s) loaded)"
+            else:
+                dsn_status[dsn_name] = f"Success - {tables_processed} table(s), {dsn_rows:,} row(s) loaded"
+
+            close_connection(connection, 'data load')
 
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(f'>> Spreadsheet "{Spreadsheet_name}" not found or access denied \n')
             load_failed = True
+            dsn_status[dsn_name] = f'Failed - spreadsheet "{Spreadsheet_name}" not found or access denied'
+            close_connection(connection, 'failure')
             return
         except gspread.exceptions.WorksheetNotFound:
             logger.error(f'>> Worksheet "{worksheet_name}" not found in spreadsheet "{Spreadsheet_name}" \n')
             load_failed = True
+            dsn_status[dsn_name] = f'Failed - worksheet "{worksheet_name}" not found'
+            close_connection(connection, 'failure')
             return
         except Exception as e:
             logger.error(f">> Error in the connection part to the query => {str(e)}\n")
+            load_failed = True
+            dsn_status[dsn_name] = f'Failed - {str(e)}'
+            close_connection(connection, 'failure')
+            restart_quickbooks(qb_path)
             return
         
-    if __name__ == "__main__":
-        try:
-            loop = asyncio.get_running_loop()  # Check if an event loop is running
-        except RuntimeError:
-            loop = None
+    async def run_all_dsns():
+        """
+        Runs the load for every configured DSN (company file) in sequence. Each
+        company file decides for itself whether QuickBooks needs cleaning up first
+        (see the per-DSN initial_load flag in main); QuickBooks is restarted once
+        after the last company file.
+        """
+        qb_path = config['qb_cred']['path_to_qb']
+        logger.info(f" >> Run started for {len(dsn_names)} company file(s): {', '.join(dsn_names)}\n")
 
-        if loop and loop.is_running():
-            logger.info(f" >> Function started and running in notebook\n")
-            asyncio.create_task(main())
-        else:
-            logger.info(f" >> Function started with a new event loop\n")
-            for dsn_name in dsn_names:
-                asyncio.run(main(dsn_name))
-                logger.info(f" >> Completed processing and logged out for DSN: {dsn_name} \n")
-                time.sleep(10)
+        for position, dsn_name in enumerate(dsn_names, start=1):
+            dsn_started_at = datetime.now()
+            DsnContextFilter.current_dsn = dsn_name
+            logger.info(f" >> [{position}/{len(dsn_names)}] Starting company file {dsn_name}\n")
+
+            await main(dsn_name)
+
+            if dsn_name not in dsn_status:
+                # main() returned without recording an outcome
+                dsn_status[dsn_name] = 'Failed - did not complete'
+            elapsed = datetime.now() - dsn_started_at
+            logger.info(f" >> [{position}/{len(dsn_names)}] Completed company file {dsn_name} in {elapsed} => {dsn_status[dsn_name]}\n")
+            DsnContextFilter.current_dsn = ''
+            await asyncio.sleep(10)
+
+        logger.info(f"\n >> ===== Run summary ({datetime.now() - run_started_at} elapsed) =====\n")
+        for name, status in dsn_status.items():
+            logger.info(f" >>   {name} : {status}\n")
+
+        # Bring QuickBooks back up for the user / the next scheduled run
+        restart_quickbooks(qb_path)
+
+    if __name__ == "__main__":
+        logger.info(f" >> Function started with a new event loop\n")
+        asyncio.run(run_all_dsns())
 
 except Exception as e:
     logger.error(f" >> Encountered error \n{e}\n")
@@ -771,5 +1117,9 @@ except Exception as e:
 
 finally:
     logger.info(f" >> Code execution completed and ready to send mail\n")
-    email_process(load_failed, config_file_path, log_filepath)
+    try:
+        email_process(load_failed, config_file_path, log_filepath)
+    except Exception as e:
+        # Never let the notification step hide the run's own failure
+        logger.error(f" >> Could not send the notification email: {str(e)}\n")
     

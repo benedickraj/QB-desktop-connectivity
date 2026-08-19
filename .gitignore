@@ -1,0 +1,10 @@
+# Runtime config pulled from the bucket - contains service account keys and the SMTP password
+iconfig.yml
+
+# Run logs
+log_history/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
