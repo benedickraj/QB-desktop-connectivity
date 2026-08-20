@@ -65,14 +65,6 @@ dsn_names = []
 
 try:
 
-    # Read inside the try so a missing/invalid config still reaches the mail step below
-    with open(config_file_path, 'r') as file:
-        config = yaml.safe_load(file) or {}
-
-    dsn_names = [dsn.strip() for dsn in str(config['qb_cred']['dsn_name']).split(',') if dsn.strip()]
-    if not dsn_names:
-        raise ValueError(f"No dsn_name configured in {config_file_path}")
-
     async def read_database(connection,query,table,itr_count):
         """
         Executes a database query asynchronously using the provided connection.
@@ -737,8 +729,9 @@ try:
             with open(config_file_path, 'r') as file:
                 initial_load = (yaml.safe_load(file) or {}).get('initial_load') or {}
             if not isinstance(initial_load, dict):
-                logger.warning(f" >> initial_load in the config file is not a mapping; treating {dsn_name} as an initial load.\n")
-                initial_load = {}
+                # validate_config refuses to start in this case; guard anyway so the
+                # writer below can never nest DSN entries under a scalar value.
+                raise ValueError("initial_load in the config file is not a mapping")
             flag = initial_load.get(dsn_name, True)
 
             with open(config_file_path, 'r') as file:
@@ -771,8 +764,15 @@ try:
                 if not updated:
                     lines.insert(block_start + 1, entry)
 
+            # Never write a file we cannot read back: the config carries the bucket
+            # credentials, and a corrupted one stops every future run.
+            candidate = "".join(lines)
+            check = yaml.safe_load(candidate)
+            if not isinstance(check, dict) or 'qb_cred' not in check or 'bucket_cred' not in check:
+                raise ValueError("rewritten config did not parse back into a valid configuration")
+
             with open(config_file_path, 'w') as f:
-                f.writelines(lines)
+                f.write(candidate)
 
             return flag
 
@@ -1106,6 +1106,48 @@ try:
 
         # Bring QuickBooks back up for the user / the next scheduled run
         restart_quickbooks(qb_path)
+
+    def validate_config(config):
+        """
+        Checks the shape of data_store_config.yml before anything runs, so a mistake
+        in the file is reported as itself instead of surfacing later as a failed load.
+        Returns the list of DSN names. Raises ValueError on the first problem found.
+        """
+        for section in ('qb_cred', 'bucket_cred'):
+            if not isinstance(config.get(section), dict):
+                raise ValueError(f"'{section}' is missing from {config_file_path} or is not a section")
+
+        for key in ('dsn_name', 'path_to_qb', 'server_name'):
+            if not str(config['qb_cred'].get(key) or '').strip():
+                raise ValueError(f"'qb_cred.{key}' is empty in {config_file_path}")
+
+        for key in ('bucket_name', 'orgid', 'datasetid', 'bucket_key'):
+            if not str(config['bucket_cred'].get(key) or '').strip():
+                raise ValueError(f"'bucket_cred.{key}' is empty in {config_file_path}")
+
+        dsn_names = [dsn.strip() for dsn in str(config['qb_cred']['dsn_name']).split(',') if dsn.strip()]
+        if not dsn_names:
+            raise ValueError(f"No dsn_name configured in {config_file_path}")
+        if len(set(dsn_names)) != len(dsn_names):
+            raise ValueError(f"'qb_cred.dsn_name' lists the same DSN more than once in {config_file_path}")
+
+        initial_load = config.get('initial_load')
+        if initial_load is not None and not isinstance(initial_load, dict):
+            raise ValueError(
+                f"'initial_load' in {config_file_path} must be one entry per DSN, not a single value. Expected:\n"
+                "initial_load:\n" + "".join(f"    '{d}' : True\n" for d in dsn_names)
+            )
+
+        return dsn_names
+
+    # Read the config only after every function above exists, so that a missing or
+    # invalid config file still reaches email_process in the finally block below.
+    with open(config_file_path, 'r') as file:
+        config = yaml.safe_load(file) or {}
+
+    dsn_names = validate_config(config)
+    logger.info(f" >> Config validated: {len(dsn_names)} company file(s) configured on server "
+                f"{config['qb_cred']['server_name']}\n")
 
     if __name__ == "__main__":
         logger.info(f" >> Function started with a new event loop\n")
