@@ -577,6 +577,7 @@ try:
         send_mail_if_success = True if config['send_mail_for_all_success'] == 'True' else False
 
         # Upload log file to the target bucket, using the credentials from iconfig
+        log_uri = None
         try:
             ecred_key_dict = json.loads(decode_bucket_cred(config['excel_cred']['key']))
             target_bucket_name = config['target_bucket_name']
@@ -585,7 +586,8 @@ try:
             log_path_in_bucket = f'{orgid}/{datasetid}/quickbooks_log/{log_filename}'
             log_blob = log_bucket.blob(log_path_in_bucket)
             log_blob.upload_from_filename(file_path)
-            logger.info(f'>> Log file uploaded to gs://{target_bucket_name}/{log_path_in_bucket}\n')
+            log_uri = f'gs://{target_bucket_name}/{log_path_in_bucket}'
+            logger.info(f'>> Log file uploaded to {log_uri}\n')
         except Exception as e:
             logger.error(f'>> Failed to upload the log file to the target bucket: {str(e)}\n')
         
@@ -611,28 +613,111 @@ try:
             named = ', '.join(failed[:3]) + (f' and {len(failed) - 3} more' if len(failed) > 3 else '')
             subject = f'Failed QuickBooks load from server {server_name} - {len(succeeded)} succeeded, {len(failed)} failed ({named})'
         else:
-            subject = f'Successfull QuickBooks load from server {server_name} - {len(succeeded)} company file(s) loaded'
+            subject = f'Successful QuickBooks load from server {server_name} - {len(succeeded)} company file(s) loaded'
 
-        elapsed = datetime.now() - run_started_at
+        finished_at = datetime.now()
+        elapsed = str(finished_at - run_started_at).split('.')[0]
+        ok = bool(dsn_status) and not failed
+
+        # ---- plain text part, for clients that do not render HTML ----
         status_lines = '\n'.join(f'   {name} : {status}' for name, status in dsn_status.items()) or '   (no company file was processed)'
         message = (
             f"Hello,\n\n"
             f" Please find attached the text file containing the log status from the client system for the server {server_name}.\n\n"
             f" Server        : {server_name}\n"
             f" Started       : {run_started_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f" Finished      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (took {elapsed})\n"
+            f" Finished      : {finished_at.strftime('%Y-%m-%d %H:%M:%S')} (took {elapsed})\n"
             f" Company files : {len(dsn_status)} processed, {len(succeeded)} succeeded, {len(failed)} failed\n\n"
             f" Status per company file:\n{status_lines}\n\n"
             f" Log file      : {log_filename}\n\n"
             f" Thanks,\n\n Team Conversight"
         )
 
-        # Create a message object
-        msg = MIMEMultipart()
+        # ---- html part ----
+        def esc(value):
+            return (str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+        accent = '#0f7b3f' if ok else '#b3261e'
+        tint = '#eaf6ee' if ok else '#fdeceb'
+        headline = 'Load completed successfully' if ok else 'Load finished with errors'
+
+        rows = []
+        for n, (name, status) in enumerate(dsn_status.items()):
+            good = str(status).startswith('Success')
+            label, _, detail = str(status).partition(' - ')
+            stripe = '#ffffff' if n % 2 == 0 else '#fafbfc'
+            rows.append(
+                f'<tr style="background:{stripe};">'
+                f'<td style="padding:10px 14px;border-top:1px solid #eceff1;font-size:14px;color:#202124;'
+                f'font-weight:600;white-space:nowrap;">{esc(name)}</td>'
+                f'<td style="padding:10px 14px;border-top:1px solid #eceff1;white-space:nowrap;">'
+                f'<span style="background:{"#eaf6ee" if good else "#fdeceb"};color:{"#0f7b3f" if good else "#b3261e"};'
+                f'font-size:11px;font-weight:700;letter-spacing:.04em;padding:3px 9px;border-radius:10px;">'
+                f'{"SUCCESS" if good else "FAILED"}</span></td>'
+                f'<td style="padding:10px 14px;border-top:1px solid #eceff1;font-size:13px;color:#5f6368;">'
+                f'{esc(detail or label)}</td></tr>'
+            )
+        if not rows:
+            rows.append(
+                '<tr><td colspan="3" style="padding:14px;border-top:1px solid #eceff1;font-size:13px;'
+                'color:#5f6368;font-style:italic;">No company file was processed.</td></tr>'
+            )
+
+        def meta_row(label, value):
+            return (f'<tr><td style="padding:3px 0;font-size:13px;color:#5f6368;width:130px;">{esc(label)}</td>'
+                    f'<td style="padding:3px 0;font-size:13px;color:#202124;">{esc(value)}</td></tr>')
+
+        meta = (
+            meta_row('Server', server_name)
+            + meta_row('Started', run_started_at.strftime('%Y-%m-%d %H:%M:%S'))
+            + meta_row('Finished', f"{finished_at.strftime('%Y-%m-%d %H:%M:%S')}  (took {elapsed})")
+            + meta_row('Company files', f'{len(dsn_status)} processed, {len(succeeded)} succeeded, {len(failed)} failed')
+            + meta_row('Log file', log_filename)
+            + (meta_row('Log location', log_uri) if log_uri else '')
+        )
+
+        html = f"""<html><body style="margin:0;padding:0;background:#f1f3f4;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f3f4;padding:24px 12px;">
+<tr><td align="center">
+<table role="presentation" width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border:1px solid #e0e3e7;border-radius:10px;overflow:hidden;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <tr><td style="background:{accent};height:5px;line-height:5px;font-size:0;">&nbsp;</td></tr>
+  <tr><td style="padding:24px 28px 4px 28px;">
+    <div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#80868b;">QuickBooks Data Load</div>
+    <div style="font-size:21px;font-weight:600;color:#202124;padding-top:6px;">{esc(headline)}</div>
+  </td></tr>
+  <tr><td style="padding:14px 28px 0 28px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+           style="background:{tint};border-radius:8px;"><tr><td style="padding:12px 16px;font-size:14px;color:{accent};font-weight:600;">
+      {len(succeeded)} of {len(dsn_status)} company file(s) loaded successfully
+    </td></tr></table>
+  </td></tr>
+  <tr><td style="padding:20px 28px 0 28px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{meta}</table>
+  </td></tr>
+  <tr><td style="padding:20px 28px 4px 28px;">
+    <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#80868b;padding-bottom:8px;">Status per company file</div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+           style="border:1px solid #eceff1;border-radius:8px;border-collapse:separate;overflow:hidden;">{''.join(rows)}</table>
+  </td></tr>
+  <tr><td style="padding:20px 28px 24px 28px;">
+    <div style="font-size:13px;color:#5f6368;line-height:1.55;">The full run log is attached to this email and stored in the bucket.</div>
+  </td></tr>
+  <tr><td style="border-top:1px solid #eceff1;padding:14px 28px;background:#fafbfc;">
+    <div style="font-size:12px;color:#80868b;">Team ConverSight &middot; automated notification</div>
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>"""
+
+        # Create a message object: alternative bodies first, then the log attachment
+        msg = MIMEMultipart('mixed')
         msg["Subject"] = subject
         msg["From"] = sender_email
         msg["To"] = ", ".join(receiver_emails)
-        msg.attach(MIMEText(message, "plain"))
+        body = MIMEMultipart('alternative')
+        body.attach(MIMEText(message, "plain"))
+        body.attach(MIMEText(html, "html"))
+        msg.attach(body)
 
         text_file_path = file_path  # Update with your actual text file path
         with open(text_file_path, "r") as text_file:
