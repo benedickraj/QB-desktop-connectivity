@@ -17,6 +17,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import asyncio
+import threading
 import sys
 import subprocess
 from pywinauto import Application
@@ -75,7 +76,7 @@ try:
                 asyncio.to_thread(dsn_connection, connection, query,table,itr_count), timeout= 600
                 )
         except asyncio.TimeoutError:
-            connection.close()
+            close_connection(connection, f'the time limit on {table}')
             logger.info(f" >> Time limit exceeded. Waiting for 5 mins and retrying. QODBC connection closed.\n")
             return None,True
     
@@ -92,7 +93,7 @@ try:
             
         except Exception as e:
             logger.error(f" >> Error in dsn while executing query {run_query} : {e}\n")
-            run_connection.close()
+            close_connection(run_connection, f'a query error on {table}')
             return None,True
 
     def decode_bucket_cred(encoded_str):
@@ -153,9 +154,15 @@ try:
                     })
                     try:
                         proc.terminate()
-                        proc.wait()
                     except Exception as e:
                         logger.error(f" >> Error terminating process {proc.pid if hasattr(proc,'pid') else '?'}: {str(e)}\n")
+                        continue
+                    try:
+                        # Bounded: a QuickBooks left on a crash dialog can outlive the
+                        # terminate, and an unbounded wait would stall the whole run.
+                        proc.wait(timeout=60)
+                    except Exception as e:
+                        logger.error(f" >> Process {proc.pid if hasattr(proc,'pid') else '?'} did not exit after terminate: {str(e)}\n")
 
             if qb_processes:
                 logger.info(f" >> Killed {len(qb_processes)} QuickBooks process(es).\n")
@@ -295,18 +302,55 @@ try:
         except Exception:
             return False
 
-    def close_connection(connection, context):
+    def close_connection(connection, context, timeout=120):
         """
         Closes the QODBC connection if it is still open. Safe to call with None.
+
+        The close runs on a daemon thread because it is a blocking QODBC call: if
+        QuickBooks dies on its way out of the session it leaves a modal dialog on
+        the desktop and the call does not return until somebody clicks it away,
+        which stalls everything after it - including the notification email.
+
+        When the close does not come back within `timeout` seconds QuickBooks is
+        killed. That is the same hard kill as before, but it now fires only when
+        the graceful release actually failed, so a clean run leaves the company
+        file properly released instead of locked by an abandoned QODBC session.
         """
         if not connection:
             return
-        try:
-            if check_connection_status(connection):
+        if not check_connection_status(connection):
+            return
+
+        outcome = {}
+
+        def _close():
+            try:
                 connection.close()
-                logger.info(f" >> QODBC connection closed after {context}.\n")
-        except Exception as e:
-            logger.error(f" >> Error while closing connection: {e}\n")
+                outcome['closed'] = True
+            except Exception as e:
+                outcome['error'] = e
+
+        closer = threading.Thread(target=_close, name='qodbc-close', daemon=True)
+        closer.start()
+        closer.join(timeout)
+
+        if closer.is_alive():
+            logger.error(
+                f" >> QODBC connection did not close within {timeout}s after {context}. "
+                f"QuickBooks is most likely showing a dialog and still holding the "
+                f"company file. Killing QuickBooks to release it.\n"
+            )
+            kill_quickbooks_process()
+            # Killing QuickBooks normally unblocks the pending ODBC call.
+            closer.join(30)
+            if closer.is_alive():
+                logger.error(f" >> QODBC close is still hanging after {context}; continuing without it.\n")
+            return
+
+        if 'error' in outcome:
+            logger.error(f" >> Error while closing connection: {outcome['error']}\n")
+        else:
+            logger.info(f" >> QODBC connection closed after {context}.\n")
 
     def split_query_by_month(query,type,current_date_flag):
         """
@@ -1056,7 +1100,7 @@ try:
 
                         elif df.shape[0]==0:
                             chunk_empty = True
-                            connection.close()
+                            close_connection(connection, f'an empty chunk for {table_name}')
                             logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt...Initiating the Quicbooks connection again\n")
                             await asyncio.sleep(180)
                             enable_retry = True
