@@ -133,15 +133,33 @@ try:
     # QuickBooks' own main window.
     BLOCKING_QB_DIALOGS = [
         # Shown while the company file opens when the IE zone security level is
-        # above default. Cancel is deliberate: it dismisses the dialog without
-        # changing the machine's security settings, and QODBC does not need the
-        # features the dialog warns about.
+        # above default. QODBC then fails the connect with 80040414, "a modal
+        # dialog box is showing in the QuickBooks user interface". Cancel is
+        # deliberate: it clears the dialog without changing the machine's
+        # security settings, and QODBC does not need the features it warns about.
         (r'^Internet Security Levels Are Set Too High$', None, r'^Cancel$'),
         (r'^Internet Security Levels Confirmation$', None, r'^Yes$'),
         # The crash on the way out of a QODBC session.
-        (r'^QuickBooks - Unrecoverable Error$', None, r"^Don.?t Send$"),
+        (r'^QuickBooks - Unrecoverable Error$', None, r'^Don.?t Send$'),
         (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$'),
     ]
+
+    def control_label(control):
+        """
+        Window text of a control with the & accelerator marker removed, so that
+        '&Make Changes' matches on 'Make Changes'.
+        """
+        try:
+            return control.window_text().replace('&', '').strip()
+        except Exception:
+            return ''
+
+    def window_is_up(window):
+        """True while the window still exists on screen."""
+        try:
+            return window.is_visible()
+        except Exception:
+            return False
 
     def dismiss_blocking_dialogs():
         """
@@ -153,7 +171,12 @@ try:
         """
         dismissed = 0
         try:
-            desktop = Desktop(backend='uia')
+            # backend='win32', not 'uia'. QuickBooks' dialogs are owned windows of
+            # the main frame, so UIA nests them instead of listing them at the
+            # desktop root, and it reports their MauiPushButton controls as Pane
+            # rather than Button - a lookup by top-level window and Button control
+            # type finds nothing. The win32 backend sees both correctly.
+            desktop = Desktop(backend='win32')
         except Exception as e:
             logger.error(f" >> Could not reach the desktop to look for QuickBooks dialogs: {e}\n")
             return 0
@@ -169,32 +192,48 @@ try:
                     # Read the title up front: it comes back empty once the
                     # window starts closing.
                     title = win.window_text()
+
+                    try:
+                        controls = win.descendants()
+                    except Exception:
+                        continue
+
                     if required_text:
-                        texts = []
-                        try:
-                            texts = [c.window_text() for c in win.descendants(control_type='Text')]
-                        except Exception:
-                            pass
-                        haystack = ' '.join([title] + texts).lower()
+                        haystack = ' '.join([title] + [control_label(c) for c in controls]).lower()
                         if required_text.lower() not in haystack:
                             continue
 
-                    # descendants() is used rather than child_window(): windows()
-                    # hands back wrappers, and child_window() only exists on a
-                    # WindowSpecification.
                     button = None
-                    for candidate in win.descendants(control_type='Button'):
-                        if re.match(button_re, candidate.window_text().strip()):
+                    for candidate in controls:
+                        if re.match(button_re, control_label(candidate)):
                             button = candidate
                             break
                     if button is None:
                         continue
 
+                    # Posted click messages first - they need no focus and do not
+                    # move the pointer. MauiPushButton is a custom control and may
+                    # ignore them, so fall back to a real click before giving up.
                     try:
-                        # Invoke pattern - does not move the real mouse pointer.
                         button.click()
                     except Exception:
-                        button.click_input()
+                        pass
+                    time.sleep(1)
+
+                    if window_is_up(win):
+                        try:
+                            win.set_focus()
+                        except Exception:
+                            pass
+                        try:
+                            button.click_input()
+                        except Exception:
+                            pass
+                        time.sleep(1)
+
+                    if window_is_up(win):
+                        logger.info(f" >> Dialog '{title}' did not respond to the click; will retry.\n")
+                        continue
 
                     logger.info(f" >> Dismissed QuickBooks dialog '{title}'.\n")
                     dismissed += 1
