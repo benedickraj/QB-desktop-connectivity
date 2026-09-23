@@ -20,7 +20,7 @@ import asyncio
 import threading
 import sys
 import subprocess
-from pywinauto import Application
+from pywinauto import Application, Desktop
 
 script_path = Path(__file__).resolve() if '__file__' in globals() else Path(sys.argv[0]).resolve()
 script_dir = script_path.parent
@@ -127,6 +127,119 @@ try:
             logger.error(f" >> Error while checking for a running QuickBooks process: {str(e)}\n")
             return False
     
+    # Dialogs QuickBooks puts up that stop a run dead until somebody clicks them.
+    # Each entry is (window title regex, text the window must contain or None,
+    # button to click). The text check stops a loose title regex from matching
+    # QuickBooks' own main window.
+    BLOCKING_QB_DIALOGS = [
+        # Shown while the company file opens when the IE zone security level is
+        # above default. Cancel is deliberate: it dismisses the dialog without
+        # changing the machine's security settings, and QODBC does not need the
+        # features the dialog warns about.
+        (r'^Internet Security Levels Are Set Too High$', None, r'^Cancel$'),
+        (r'^Internet Security Levels Confirmation$', None, r'^Yes$'),
+        # The crash on the way out of a QODBC session.
+        (r'^QuickBooks - Unrecoverable Error$', None, r"^Don.?t Send$"),
+        (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$'),
+    ]
+
+    def dismiss_blocking_dialogs():
+        """
+        Clicks away any known blocking QuickBooks dialog currently on screen.
+
+        Returns the number of dialogs dismissed. Never raises: this runs on a
+        watcher thread and beside a blocked QODBC call, so a failure here must
+        not take anything else down with it.
+        """
+        dismissed = 0
+        try:
+            desktop = Desktop(backend='uia')
+        except Exception as e:
+            logger.error(f" >> Could not reach the desktop to look for QuickBooks dialogs: {e}\n")
+            return 0
+
+        for title_re, required_text, button_re in BLOCKING_QB_DIALOGS:
+            try:
+                windows = desktop.windows(title_re=title_re, top_level_only=True)
+            except Exception:
+                continue
+
+            for win in windows:
+                try:
+                    # Read the title up front: it comes back empty once the
+                    # window starts closing.
+                    title = win.window_text()
+                    if required_text:
+                        texts = []
+                        try:
+                            texts = [c.window_text() for c in win.descendants(control_type='Text')]
+                        except Exception:
+                            pass
+                        haystack = ' '.join([title] + texts).lower()
+                        if required_text.lower() not in haystack:
+                            continue
+
+                    # descendants() is used rather than child_window(): windows()
+                    # hands back wrappers, and child_window() only exists on a
+                    # WindowSpecification.
+                    button = None
+                    for candidate in win.descendants(control_type='Button'):
+                        if re.match(button_re, candidate.window_text().strip()):
+                            button = candidate
+                            break
+                    if button is None:
+                        continue
+
+                    try:
+                        # Invoke pattern - does not move the real mouse pointer.
+                        button.click()
+                    except Exception:
+                        button.click_input()
+
+                    logger.info(f" >> Dismissed QuickBooks dialog '{title}'.\n")
+                    dismissed += 1
+                except Exception:
+                    continue
+
+        return dismissed
+
+    _dialog_watcher = {'stop': None, 'thread': None}
+
+    def start_dialog_watcher(interval=5):
+        """
+        Polls for the dialogs above on a daemon thread. Needed because they
+        appear while the main thread is blocked inside a QODBC call - during
+        `pyodbc.connect` as the company file opens, and again on close - so
+        nothing on the main thread is in a position to notice them.
+        """
+        if _dialog_watcher['thread'] is not None:
+            return
+
+        stop = threading.Event()
+
+        def _watch():
+            while not stop.wait(interval):
+                dismiss_blocking_dialogs()
+
+        thread = threading.Thread(target=_watch, name='qb-dialog-watcher', daemon=True)
+        _dialog_watcher['stop'] = stop
+        _dialog_watcher['thread'] = thread
+        thread.start()
+        logger.info(f" >> Watching for blocking QuickBooks dialogs every {interval}s.\n")
+
+    def stop_dialog_watcher():
+        """Stops the watcher started by `start_dialog_watcher`. Safe to call twice."""
+        stop = _dialog_watcher.get('stop')
+        thread = _dialog_watcher.get('thread')
+        if stop is None:
+            return
+        stop.set()
+        if thread is not None:
+            thread.join(10)
+        _dialog_watcher['stop'] = None
+        _dialog_watcher['thread'] = None
+        logger.info(" >> Stopped watching for QuickBooks dialogs.\n")
+
     def kill_quickbooks_process():
         """
         Find and kill any running QuickBooks processes.
@@ -340,7 +453,11 @@ try:
                 f"QuickBooks is most likely showing a dialog and still holding the "
                 f"company file. Killing QuickBooks to release it.\n"
             )
-            kill_quickbooks_process()
+            if dismiss_blocking_dialogs():
+                # Clicking the dialog away may be enough to let the close finish.
+                closer.join(30)
+            if closer.is_alive():
+                kill_quickbooks_process()
             # Killing QuickBooks normally unblocks the pending ODBC call.
             closer.join(30)
             if closer.is_alive():
@@ -1214,6 +1331,17 @@ try:
         qb_path = config['qb_cred']['path_to_qb']
         logger.info(f" >> Run started for {len(dsn_names)} company file(s): {', '.join(dsn_names)}\n")
 
+        start_dialog_watcher()
+        try:
+            await load_every_dsn(qb_path)
+        finally:
+            stop_dialog_watcher()
+
+    async def load_every_dsn(qb_path):
+        """
+        The body of `run_all_dsns`, split out so the dialog watcher wraps all of
+        it - including the restart at the end.
+        """
         for position, dsn_name in enumerate(dsn_names, start=1):
             dsn_started_at = datetime.now()
             DsnContextFilter.current_dsn = dsn_name
