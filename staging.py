@@ -20,6 +20,7 @@ import asyncio
 import threading
 import sys
 import subprocess
+import winreg
 from pywinauto import Application, Desktop
 
 script_path = Path(__file__).resolve() if '__file__' in globals() else Path(sys.argv[0]).resolve()
@@ -948,14 +949,61 @@ try:
         except Exception as e:
             result = "Email sending failed:", str(e) 
 
+    def company_file_for_dsn(dsn_name):
+        """
+        Best-effort lookup of the company file a DSN points at, read from the
+        DSN's own ODBC registry entry so the path does not have to be repeated
+        in data_store_config.yml and drift out of step with it.
+
+        The value name QODBC uses is not relied on: any value under the DSN that
+        looks like a .qbw path is taken. Returns None if nothing is found.
+        """
+        locations = [
+            (winreg.HKEY_CURRENT_USER, 0),
+            (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+            (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+        ]
+        for root, access_flag in locations:
+            try:
+                key = winreg.OpenKey(root, rf'SOFTWARE\ODBC\ODBC.INI\{dsn_name}',
+                                     0, winreg.KEY_READ | access_flag)
+            except Exception:
+                continue
+            try:
+                value_count = winreg.QueryInfoKey(key)[1]
+                for index in range(value_count):
+                    try:
+                        _, value, _ = winreg.EnumValue(key, index)
+                    except Exception:
+                        continue
+                    if isinstance(value, str) and value.lower().strip().endswith('.qbw'):
+                        return value.strip()
+            except Exception:
+                pass
+            finally:
+                try:
+                    key.Close()
+                except Exception:
+                    pass
+        return None
+
     async def connect_to_qodbc(qb_path, dsn_name, max_retries=3, timeout=600):
         """
         Asynchronously attempts to connect to QuickBooks via pyodbc.
-        Retries on failure up to max_retries. Returns connection and failure flag.
+        Retries on failure up to max_retries.
+
+        Returns (connection, failed, reason). `reason` is a human-readable
+        explanation when the failure has a known cause, otherwise None.
 
         When QuickBooks reports 8004040A (a different company file is already
         open) the recovery escalates: first a graceful UI logout, and only if
         that does not release the file a forced restart of QuickBooks.
+
+        80040435 is not retried. It means QuickBooks will not let the driver log
+        in automatically until somebody opens the company file in QuickBooks
+        once - which happens every time a clone is refreshed, because the
+        refreshed file has not been opened at that location yet. Retrying can
+        never clear it, so the run says what needs doing and stops.
         """
         retries = 0
         logout_attempts = 0
@@ -966,7 +1014,7 @@ try:
                     timeout=timeout
                 )
                 logger.info(f'Quickbooks Connected successfully..\n')
-                return connection, False 
+                return connection, False, None
             
             except asyncio.TimeoutError:
                 retries += 1
@@ -976,6 +1024,17 @@ try:
                 retries += 1
                 error_message = str(e1)
                 logger.info(f'>> Error in Initialing Quickbooks => {error_message}\n')
+                if '80040435' in error_message:
+                    company_file = company_file_for_dsn(dsn_name)
+                    target = company_file or f'the company file for DSN {dsn_name}'
+                    reason = (
+                        'QuickBooks will not allow an automatic login until this company '
+                        f'file has been opened once in QuickBooks: {target}. This is needed '
+                        'again every time the clone is refreshed. Open it in QuickBooks as '
+                        'the account the load runs as, then re-run.'
+                    )
+                    logger.error(f' >> {reason}\n')
+                    return None, True, reason
                 if '8004040a' in error_message.lower():
                     logout_attempts += 1
                     if logout_attempts <= 1:
@@ -990,11 +1049,11 @@ try:
                     await asyncio.sleep(300)
             except Exception as e:
                 logger.error(f'Unexpected error while Quickbooks connection => {e}\n')
-                return None, True
+                return None, True, None
 
         logger.error(f'Max retries reached. Connection failed..\n')
         restart_quickbooks(qb_path)
-        return None, True
+        return None, True, None
 
     def consume_initial_load_flag(dsn_name):
         """
@@ -1107,11 +1166,11 @@ try:
         try:
             logger.info(f" >> Connecting to Quickbooks with DSN: {dsn_name}\n")
 
-            connection, failed = await connect_to_qodbc(qb_path, dsn_name)
+            connection, failed, reason = await connect_to_qodbc(qb_path, dsn_name)
             if failed :
-                logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
+                logger.info(f" >> Quickbooks connection failed..Terminating the code..\n")
                 load_failed = True
-                dsn_status[dsn_name] = 'Failed - could not connect to QuickBooks'
+                dsn_status[dsn_name] = f'Failed - {reason}' if reason else 'Failed - could not connect to QuickBooks'
                 return
             # bucket_cred is only used to fetch iconfig.yml
             json_key = decode_bucket_cred(data_store_config['bucket_cred']['bucket_key'])
@@ -1239,7 +1298,7 @@ try:
                         if df is None and enable_retry:
                             logger.info(f">> Retrying the same query for table {table_name} as failing in passing query through pyodbc\n")
                             enable_retry = True
-                            connection, failed = await connect_to_qodbc(qb_path, dsn_name)
+                            connection, failed, reason = await connect_to_qodbc(qb_path, dsn_name)
                             if failed :
                                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
                                 logger.info(f" >> Failed to load {table_name}. Updating the delta table to the backup version {backup_version}")
@@ -1260,7 +1319,7 @@ try:
                             logger.info(f" >> Retrying the same query for table {table_name} after 3 minutes, as an empty dataframe was received during the previous attempt...Initiating the Quicbooks connection again\n")
                             await asyncio.sleep(180)
                             enable_retry = True
-                            connection, failed = await connect_to_qodbc(qb_path, dsn_name)
+                            connection, failed, reason = await connect_to_qodbc(qb_path, dsn_name)
                             if failed :
                                 logger.info(f" >> Quickbooks connection failed even after the retries..Terminating the code..\n")
                                 logger.info(f" >> data load not done for table {table_name}..updating the delta table to the backup version ie {backup_version}")
