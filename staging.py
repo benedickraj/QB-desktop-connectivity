@@ -280,17 +280,66 @@ try:
         _dialog_watcher['thread'] = None
         logger.info(" >> Stopped watching for QuickBooks dialogs.\n")
 
-    def kill_quickbooks_process():
+    def ask_quickbooks_to_close(pid, timeout=180):
         """
-        Find and kill any running QuickBooks processes.
+        Ask a QuickBooks process to shut down the way a person closing the window
+        would, by posting WM_CLOSE to its top-level windows, and wait for it to go.
+
+        This matters more than it looks. QuickBooks writes pending state to the
+        company file as it shuts down - the user's password, the registration
+        that lets the driver log in automatically at this file's location, and
+        the rest. TerminateProcess discards all of it, so a run that hard-killed
+        QuickBooks would silently undo configuration changes and leave the next
+        run to fail authorization again.
+
+        Returns True if the process exited on its own, False otherwise.
+        """
+        try:
+            app = Application(backend='win32').connect(process=pid, timeout=10)
+        except Exception as e:
+            logger.info(f" >> Could not attach to QuickBooks (PID {pid}) to close it politely: {e}\n")
+            return False
+
+        try:
+            # soft=True posts WM_CLOSE rather than terminating.
+            app.kill(soft=True)
+        except Exception as e:
+            logger.info(f" >> QuickBooks (PID {pid}) did not accept the close request: {e}\n")
+            return False
+
+        try:
+            gone = psutil.Process(pid)
+        except Exception:
+            # Already gone.
+            return True
+
+        try:
+            # The dialog watcher clears the prompts QuickBooks raises on the way
+            # out; this just waits for the process to finish writing and exit.
+            gone.wait(timeout=timeout)
+            return True
+        except Exception:
+            logger.info(f" >> QuickBooks (PID {pid}) did not finish closing within {timeout}s.\n")
+            return False
+
+    def kill_quickbooks_process(graceful=True, graceful_timeout=180):
+        """
+        Shut down any running QuickBooks processes.
+
+        By default each one is asked to close properly first and only terminated
+        if that does not work, so QuickBooks gets to flush its state to the
+        company file. Pass graceful=False when QuickBooks is already wedged and
+        the only goal is to make it go away - waiting politely on a process that
+        is stuck on a crash dialog just burns the timeout.
 
         Returns:
-            List[dict]: A list of dicts describing the killed processes. Each dict
-            contains 'name' and 'exe' keys. If nothing was found or an error
-            occurred an empty list is returned.
+            List[dict]: A list of dicts describing the processes that were shut
+            down. Each dict contains 'name' and 'exe' keys. If nothing was found
+            or an error occurred an empty list is returned.
         """
         try:
             qb_processes = []
+            forced = 0
             logger.info(f" >> Looking for QuickBooks processes.\n")
             for proc in psutil.process_iter(['pid', 'name', 'exe']):
                 try:
@@ -300,25 +349,36 @@ try:
                     continue
 
                 if pname in ['qbw.exe', 'qbw32.exe']:
-                    logger.info(f" >> Found process: {proc.info.get('name')} (PID: {proc.info.get('pid')})")
+                    pid = proc.info.get('pid')
+                    logger.info(f" >> Found process: {proc.info.get('name')} (PID: {pid})")
                     qb_processes.append({
                         'name': proc.info.get('name'),
                         'exe': proc.info.get('exe')
                     })
+
+                    if graceful and ask_quickbooks_to_close(pid, graceful_timeout):
+                        logger.info(f" >> QuickBooks (PID {pid}) closed cleanly.\n")
+                        continue
+
+                    if graceful:
+                        logger.info(f" >> Falling back to terminating QuickBooks (PID {pid}); "
+                                    f"anything it had not written to the company file is lost.\n")
                     try:
                         proc.terminate()
                     except Exception as e:
-                        logger.error(f" >> Error terminating process {proc.pid if hasattr(proc,'pid') else '?'}: {str(e)}\n")
+                        logger.error(f" >> Error terminating process {pid}: {str(e)}\n")
                         continue
+                    forced += 1
                     try:
                         # Bounded: a QuickBooks left on a crash dialog can outlive the
                         # terminate, and an unbounded wait would stall the whole run.
                         proc.wait(timeout=60)
                     except Exception as e:
-                        logger.error(f" >> Process {proc.pid if hasattr(proc,'pid') else '?'} did not exit after terminate: {str(e)}\n")
+                        logger.error(f" >> Process {pid} did not exit after terminate: {str(e)}\n")
 
             if qb_processes:
-                logger.info(f" >> Killed {len(qb_processes)} QuickBooks process(es).\n")
+                logger.info(f" >> Shut down {len(qb_processes)} QuickBooks process(es) "
+                            f"({forced} had to be terminated).\n")
             else:
                 logger.info(f" >> No QuickBooks processes found to kill.\n")
 
@@ -497,7 +557,7 @@ try:
                 # Clicking the dialog away may be enough to let the close finish.
                 closer.join(30)
             if closer.is_alive():
-                kill_quickbooks_process()
+                kill_quickbooks_process(graceful=False)
             # Killing QuickBooks normally unblocks the pending ODBC call.
             closer.join(30)
             if closer.is_alive():
