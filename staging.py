@@ -532,11 +532,19 @@ try:
         # Kill any existing QuickBooks instances before attempting connection or data load.
         # We capture the list of killed processes (name + exe path) so we can relaunch them
         # at the end of the run or on failure.
-        qb_procs = kill_quickbooks_process()
-
+        if not config.get('initial_load',True):
+            qb_procs = kill_quickbooks_process()
+        config['initial_load'] = False
         dsn_name = config['qb_cred']['dsn_name']
         server_name = config['qb_cred']['server_name']
         
+        with open(config_file_path, "w") as f:
+            yaml.safe_dump(
+                config,
+                f,
+                default_flow_style=False,
+                sort_keys=False
+            )
 
         try: 
 
