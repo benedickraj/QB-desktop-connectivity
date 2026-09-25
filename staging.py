@@ -62,6 +62,15 @@ load_failed = False
 dsn_status = {}
 run_started_at = datetime.now()
 
+# How long a single chunk of one table may take before it is abandoned and
+# retried. This has to be generous: a monthly chunk of the transaction table is
+# a join and aggregate across the whole company file, and QODBC regularly needs
+# well over ten minutes for one. The old 600s cut those queries off mid-flight,
+# so the table could never finish - three retries, each killed at the same
+# point, and no rows loaded. Lower it only with a table like lw_transaction to
+# test against.
+QUERY_TIMEOUT_SECONDS = 7200
+
 config = {}
 dsn_names = []
 
@@ -74,7 +83,8 @@ try:
         """
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(dsn_connection, connection, query,table,itr_count), timeout= 600
+                asyncio.to_thread(dsn_connection, connection, query,table,itr_count),
+                timeout=QUERY_TIMEOUT_SECONDS
                 )
         except asyncio.TimeoutError:
             close_connection(connection, f'the time limit on {table}')
