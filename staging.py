@@ -6,6 +6,8 @@ import os
 import re
 import psutil
 import base64, json
+import ctypes
+import ctypes.wintypes as wintypes
 from google.cloud import storage
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -172,6 +174,102 @@ try:
         except Exception:
             return False
 
+    # Win32 message constants used to press a button without an interactive
+    # desktop. See press_button below for why that matters.
+    _WM_COMMAND = 0x0111
+    _BM_CLICK = 0x00F5
+    _WM_LBUTTONDOWN = 0x0201
+    _WM_LBUTTONUP = 0x0202
+    _MK_LBUTTON = 0x0001
+    _BN_CLICKED = 0
+    _SMTO_ABORTIFHUNG = 0x0002
+
+    _user32 = ctypes.windll.user32
+    _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.GetDlgCtrlID.argtypes = [wintypes.HWND]
+    _user32.GetDlgCtrlID.restype = ctypes.c_int
+    _user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_ulong)]
+
+    def send_bm_click(button_handle):
+        """BM_CLICK - what a standard button expects."""
+        result = ctypes.c_ulong()
+        _user32.SendMessageTimeoutW(button_handle, _BM_CLICK, 0, 0,
+                                    _SMTO_ABORTIFHUNG, 3000, ctypes.byref(result))
+
+    def send_wm_command(dialog_handle, button_handle):
+        """
+        The BN_CLICKED notification the button would send its parent. Custom
+        controls that ignore BM_CLICK often still drive their dialog this way.
+        """
+        control_id = _user32.GetDlgCtrlID(button_handle)
+        wparam = (_BN_CLICKED << 16) | (control_id & 0xFFFF)
+        _user32.PostMessageW(dialog_handle, _WM_COMMAND, wparam, button_handle)
+
+    def send_mouse_messages(button_handle):
+        """A press and release posted straight to the control."""
+        _user32.PostMessageW(button_handle, _WM_LBUTTONDOWN, _MK_LBUTTON, 0)
+        _user32.PostMessageW(button_handle, _WM_LBUTTONUP, 0, 0)
+
+    def press_button(window, button):
+        """
+        Press a dialog button, trying the ways that need no desktop first.
+
+        This ordering is the whole point. click_input() synthesises real mouse
+        input, which requires an interactive desktop - and a disconnected RDP
+        session does not have one. The moment somebody closes the remote window
+        the mouse path stops working and the dialog sits there forever, which is
+        exactly what happens on an unattended scheduled run. Posted messages are
+        delivered either way, so they are tried first and the mouse is only a
+        last resort for when a person happens to be watching.
+
+        Returns the name of whatever worked, or None.
+        """
+        try:
+            dialog_handle = window.handle
+            button_handle = button.handle
+        except Exception:
+            return None
+
+        def real_click():
+            try:
+                window.set_focus()
+            except Exception:
+                pass
+            button.click_input()
+
+        attempts = [
+            ('BM_CLICK', lambda: send_bm_click(button_handle)),
+            ('WM_COMMAND', lambda: send_wm_command(dialog_handle, button_handle)),
+            ('mouse messages', lambda: send_mouse_messages(button_handle)),
+            ('synthetic mouse', real_click),
+        ]
+
+        for name, attempt in attempts:
+            try:
+                attempt()
+            except Exception:
+                continue
+            time.sleep(1)
+            if not window_is_up(window):
+                return name
+        return None
+
+    # Titles already reported as unclickable, so a dialog nobody can clear does
+    # not write a line every few seconds for hours.
+    _dialog_complaints = {}
+
+    def note_unclickable(title, interval=300):
+        """Log that a dialog would not close, at most once every `interval` seconds."""
+        now = time.time()
+        last = _dialog_complaints.get(title, 0)
+        if now - last < interval:
+            return
+        _dialog_complaints[title] = now
+        logger.info(f" >> Dialog '{title}' is up but will not respond to a click; still trying.\n")
+
     def dismiss_blocking_dialogs():
         """
         Clicks away any known blocking QuickBooks dialog currently on screen.
@@ -214,6 +312,9 @@ try:
                         if required_text.lower() not in haystack:
                             continue
 
+                    # descendants() is used rather than child_window(): windows()
+                    # hands back wrappers, and child_window() only exists on a
+                    # WindowSpecification.
                     button = None
                     for candidate in controls:
                         if re.match(button_re, control_label(candidate)):
@@ -222,31 +323,13 @@ try:
                     if button is None:
                         continue
 
-                    # Posted click messages first - they need no focus and do not
-                    # move the pointer. MauiPushButton is a custom control and may
-                    # ignore them, so fall back to a real click before giving up.
-                    try:
-                        button.click()
-                    except Exception:
-                        pass
-                    time.sleep(1)
-
-                    if window_is_up(win):
-                        try:
-                            win.set_focus()
-                        except Exception:
-                            pass
-                        try:
-                            button.click_input()
-                        except Exception:
-                            pass
-                        time.sleep(1)
-
-                    if window_is_up(win):
-                        logger.info(f" >> Dialog '{title}' did not respond to the click; will retry.\n")
+                    how = press_button(win, button)
+                    if how is None:
+                        note_unclickable(title)
                         continue
 
-                    logger.info(f" >> Dismissed QuickBooks dialog '{title}'.\n")
+                    _dialog_complaints.pop(title, None)
+                    logger.info(f" >> Dismissed QuickBooks dialog '{title}' via {how}.\n")
                     dismissed += 1
                 except Exception:
                     continue
