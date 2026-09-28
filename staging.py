@@ -144,7 +144,17 @@ try:
     # Each entry is (window title regex, text the window must contain or None,
     # button to click). The text check stops a loose title regex from matching
     # QuickBooks' own main window.
+    # Order matters. Windows disables a window while a modal dialog owns it, so a
+    # dialog stacked on top of another has to be cleared first - otherwise the
+    # click on the one underneath lands on a disabled window and silently does
+    # nothing. That is what stranded a run for 24 minutes: the theme warning and
+    # the crash dialog were sitting on top of the security prompt.
     BLOCKING_QB_DIALOGS = [
+        # Raised when the desktop theme changes underneath QuickBooks, which is
+        # what happens when an RDP session disconnects.
+        (r'^Warning$', 'Theme settings have changed', r'^OK$'),
+        # Windows Error Reporting, after QuickBooks has fallen over.
+        (r'^QuickBooks$', 'has stopped working', r'^Close the program'),
         # Shown while the company file opens when the IE zone security level is
         # above default. QODBC then fails the connect with 80040414, "a modal
         # dialog box is showing in the QuickBooks user interface". Cancel is
