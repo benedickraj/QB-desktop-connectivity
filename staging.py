@@ -197,6 +197,8 @@ try:
     _user32 = ctypes.windll.user32
     _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+    _user32.IsWindowEnabled.restype = wintypes.BOOL
     _user32.GetDlgCtrlID.argtypes = [wintypes.HWND]
     _user32.GetDlgCtrlID.restype = ctypes.c_int
     _user32.SendMessageTimeoutW.argtypes = [
@@ -271,14 +273,50 @@ try:
     # not write a line every few seconds for hours.
     _dialog_complaints = {}
 
-    def note_unclickable(title, interval=300):
-        """Log that a dialog would not close, at most once every `interval` seconds."""
+    def note_unclickable(window, title, desktop, interval=300):
+        """
+        Log that a dialog would not close, at most once every `interval` seconds,
+        along with enough state to tell why.
+
+        A disabled window means something else is holding input - almost always
+        another modal on top - and no message we post will ever land. In that
+        case the other visible windows are listed, because one of them is the
+        thing that actually needs clearing first and it may not be in
+        BLOCKING_QB_DIALOGS yet.
+        """
         now = time.time()
         last = _dialog_complaints.get(title, 0)
         if now - last < interval:
             return
         _dialog_complaints[title] = now
-        logger.info(f" >> Dialog '{title}' is up but will not respond to a click; still trying.\n")
+
+        try:
+            enabled = bool(_user32.IsWindowEnabled(window.handle))
+        except Exception:
+            enabled = None
+
+        logger.info(f" >> Dialog '{title}' is up but will not respond to a click "
+                    f"(window enabled: {enabled}); still trying.\n")
+
+        if enabled:
+            # The window is taking input, so the control itself is ignoring us.
+            # Listing the desktop would not add anything.
+            return
+
+        try:
+            others = []
+            for other in desktop.windows():
+                try:
+                    other_title = other.window_text().strip()
+                except Exception:
+                    continue
+                if other_title and other_title != title:
+                    others.append(other_title)
+            if others:
+                logger.info(f" >> Other windows currently open, one of which is blocking it: "
+                            f"{'; '.join(others[:15])}\n")
+        except Exception:
+            pass
 
     def dismiss_blocking_dialogs():
         """
@@ -335,7 +373,7 @@ try:
 
                     how = press_button(win, button)
                     if how is None:
-                        note_unclickable(title)
+                        note_unclickable(win, title, desktop)
                         continue
 
                     _dialog_complaints.pop(title, None)
