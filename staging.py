@@ -192,6 +192,7 @@ try:
     # Win32 message constants used to press a button without an interactive
     # desktop. See press_button below for why that matters.
     _WM_COMMAND = 0x0111
+    _WM_CLOSE = 0x0010
     _BM_CLICK = 0x00F5
     _WM_LBUTTONDOWN = 0x0201
     _WM_LBUTTONUP = 0x0202
@@ -202,6 +203,8 @@ try:
     _user32 = ctypes.windll.user32
     _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _user32.GetClientRect.restype = wintypes.BOOL
     _user32.IsWindowEnabled.argtypes = [wintypes.HWND]
     _user32.IsWindowEnabled.restype = wintypes.BOOL
     _user32.GetDlgCtrlID.argtypes = [wintypes.HWND]
@@ -225,10 +228,48 @@ try:
         wparam = (_BN_CLICKED << 16) | (control_id & 0xFFFF)
         _user32.PostMessageW(dialog_handle, _WM_COMMAND, wparam, button_handle)
 
+    def button_centre_lparam(button_handle):
+        """
+        The control's centre point packed as an lParam.
+
+        A custom control hit-tests the coordinate it is given, and (0, 0) - the
+        extreme top-left corner - can fall outside whatever region it considers
+        clickable. The centre always lands on the button.
+        """
+        rect = wintypes.RECT()
+        if not _user32.GetClientRect(button_handle, ctypes.byref(rect)):
+            return 0
+        x = (rect.right - rect.left) // 2
+        y = (rect.bottom - rect.top) // 2
+        return ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+
     def send_mouse_messages(button_handle):
-        """A press and release posted straight to the control."""
-        _user32.PostMessageW(button_handle, _WM_LBUTTONDOWN, _MK_LBUTTON, 0)
-        _user32.PostMessageW(button_handle, _WM_LBUTTONUP, 0, 0)
+        """A press and release posted to the control, aimed at its centre."""
+        lparam = button_centre_lparam(button_handle)
+        _user32.PostMessageW(button_handle, _WM_LBUTTONDOWN, _MK_LBUTTON, lparam)
+        _user32.PostMessageW(button_handle, _WM_LBUTTONUP, 0, lparam)
+
+    def send_mouse_messages_sync(button_handle):
+        """
+        The same press and release, delivered synchronously.
+
+        A control that drives its action from the posted queue may behave
+        differently from one that expects the message handled inline, so both
+        are worth trying before resorting to real input.
+        """
+        lparam = button_centre_lparam(button_handle)
+        result = ctypes.c_ulong()
+        _user32.SendMessageTimeoutW(button_handle, _WM_LBUTTONDOWN, _MK_LBUTTON, lparam,
+                                    _SMTO_ABORTIFHUNG, 3000, ctypes.byref(result))
+        _user32.SendMessageTimeoutW(button_handle, _WM_LBUTTONUP, 0, lparam,
+                                    _SMTO_ABORTIFHUNG, 3000, ctypes.byref(result))
+
+    def send_close(dialog_handle):
+        """
+        Ask the dialog to close, which a dialog normally treats as its cancel
+        action. Only safe where cancelling is what we wanted anyway.
+        """
+        _user32.PostMessageW(dialog_handle, _WM_CLOSE, 0, 0)
 
     def press_button(window, button):
         """
@@ -261,8 +302,18 @@ try:
             ('BM_CLICK', lambda: send_bm_click(button_handle)),
             ('WM_COMMAND', lambda: send_wm_command(dialog_handle, button_handle)),
             ('mouse messages', lambda: send_mouse_messages(button_handle)),
-            ('synthetic mouse', real_click),
+            ('sent mouse messages', lambda: send_mouse_messages_sync(button_handle)),
         ]
+
+        # WM_CLOSE maps to a dialog's cancel action, so it is only tried where
+        # that matches the button we were aiming for. On a confirmation it would
+        # pick the opposite answer.
+        if control_label(button).lower() in ('cancel', 'ok', 'close the program'):
+            attempts.append(('WM_CLOSE', lambda: send_close(dialog_handle)))
+
+        # Real input is last: it needs an interactive desktop, so it is the one
+        # that stops working the moment nobody is looking at the screen.
+        attempts.append(('synthetic mouse', real_click))
 
         for name, attempt in attempts:
             try:
