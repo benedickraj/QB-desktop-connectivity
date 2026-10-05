@@ -193,6 +193,12 @@ try:
     # desktop. See press_button below for why that matters.
     _WM_COMMAND = 0x0111
     _WM_CLOSE = 0x0010
+    _WM_KEYDOWN = 0x0100
+    _WM_KEYUP = 0x0101
+    _VK_SPACE = 0x20
+    # Realistic scan-code lParams for the space bar: some controls read them.
+    _SPACE_DOWN_LPARAM = 0x00390001
+    _SPACE_UP_LPARAM = 0xC0390001
     _BM_CLICK = 0x00F5
     _WM_LBUTTONDOWN = 0x0201
     _WM_LBUTTONUP = 0x0202
@@ -278,6 +284,21 @@ try:
         lowered = button_re.lower()
         return any(name in lowered for name in _CLOSE_EQUIVALENT_BUTTONS)
 
+    def send_space_key(button_handle):
+        """
+        Activate a button the way the keyboard does.
+
+        This matters because of what it does *not* do. WM_CLOSE dismisses the
+        window out from under the application, which clears the dialog but
+        appears to leave QuickBooks mid-flow - every run that used it crashed
+        straight afterwards, while every run where the button was genuinely
+        pressed connected fine. A space keypress runs the control's own
+        activation path, the same one a real click runs, but arrives as a
+        message so it needs no interactive desktop.
+        """
+        _user32.PostMessageW(button_handle, _WM_KEYDOWN, _VK_SPACE, _SPACE_DOWN_LPARAM)
+        _user32.PostMessageW(button_handle, _WM_KEYUP, _VK_SPACE, _SPACE_UP_LPARAM)
+
     def send_close(dialog_handle):
         """
         Ask the dialog to close, which a dialog normally treats as its cancel
@@ -315,13 +336,16 @@ try:
         attempts = [
             ('BM_CLICK', lambda: send_bm_click(button_handle)),
             ('WM_COMMAND', lambda: send_wm_command(dialog_handle, button_handle)),
+            ('space key', lambda: send_space_key(button_handle)),
             ('mouse messages', lambda: send_mouse_messages(button_handle)),
             ('sent mouse messages', lambda: send_mouse_messages_sync(button_handle)),
         ]
 
         # WM_CLOSE maps to a dialog's cancel action, so it is only tried where
         # that matches the button we were aiming for. On a confirmation it would
-        # pick the opposite answer.
+        # pick the opposite answer. It is also deliberately late: it clears the
+        # dialog without running the button's own handler, which is the
+        # suspected cause of QuickBooks crashing immediately afterwards.
         if closing_matches_intent(control_label(button)):
             attempts.append(('WM_CLOSE', lambda: send_close(dialog_handle)))
 
