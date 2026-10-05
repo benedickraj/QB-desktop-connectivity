@@ -264,6 +264,20 @@ try:
         _user32.SendMessageTimeoutW(button_handle, _WM_LBUTTONUP, 0, lparam,
                                     _SMTO_ABORTIFHUNG, 3000, ctypes.byref(result))
 
+    _CLOSE_EQUIVALENT_BUTTONS = ('cancel', 'ok', 'close')
+
+    def closing_matches_intent(button_re):
+        """
+        True when closing a dialog does the same thing as pressing the button we
+        were aiming for. Closing is a dialog's cancel action, so it is right for
+        Cancel, OK and Close, and wrong for anything that picks a side - on a
+        confirmation it would answer the opposite of what we wanted.
+        """
+        if not button_re:
+            return True
+        lowered = button_re.lower()
+        return any(name in lowered for name in _CLOSE_EQUIVALENT_BUTTONS)
+
     def send_close(dialog_handle):
         """
         Ask the dialog to close, which a dialog normally treats as its cancel
@@ -308,7 +322,7 @@ try:
         # WM_CLOSE maps to a dialog's cancel action, so it is only tried where
         # that matches the button we were aiming for. On a confirmation it would
         # pick the opposite answer.
-        if control_label(button).lower() in ('cancel', 'ok', 'close the program'):
+        if closing_matches_intent(control_label(button)):
             attempts.append(('WM_CLOSE', lambda: send_close(dialog_handle)))
 
         # Real input is last: it needs an interactive desktop, so it is the one
@@ -424,7 +438,26 @@ try:
                         if re.match(button_re, control_label(candidate)):
                             button = candidate
                             break
+
                     if button is None:
+                        # Some dialogs have no real button to press - Windows
+                        # Error Reporting draws its options as task-dialog
+                        # command links rather than child windows, so nothing
+                        # turns up in descendants(). Closing those does the same
+                        # thing as their default option, so try that rather than
+                        # giving up with the dialog still on screen.
+                        if not closing_matches_intent(button_re):
+                            note_unclickable(win, title, desktop)
+                            continue
+                        send_close(win.handle)
+                        time.sleep(1)
+                        if window_is_up(win):
+                            note_unclickable(win, title, desktop)
+                            continue
+                        _dialog_complaints.pop(title, None)
+                        logger.info(f" >> Dismissed QuickBooks dialog '{title}' via WM_CLOSE "
+                                    f"(no button control found).\n")
+                        dismissed += 1
                         continue
 
                     how = press_button(win, button)
