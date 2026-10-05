@@ -157,9 +157,16 @@ try:
         (r'^QuickBooks$', 'has stopped working', r'^Close the program'),
         # Shown while the company file opens when the IE zone security level is
         # above default. QODBC then fails the connect with 80040414, "a modal
-        # dialog box is showing in the QuickBooks user interface". Cancel is
-        # deliberate: it clears the dialog without changing the machine's
-        # security settings, and QODBC does not need the features it warns about.
+        # dialog box is showing in the QuickBooks user interface".
+        #
+        # These two should no longer fire: the running account's IE Internet
+        # zone is set to Medium-high (CurrentLevel 0x11500 under HKCU\Software\
+        # Microsoft\Windows\CurrentVersion\Internet Settings\Zones\3), so
+        # QuickBooks stops asking. They are kept because IE Enhanced Security
+        # Configuration is still enabled on the server and may reapply the High
+        # setting after an update, and because an entry that never matches costs
+        # nothing. If they start appearing in the log again, check that
+        # registry value first.
         (r'^Internet Security Levels Are Set Too High$', None, r'^Cancel$'),
         (r'^Internet Security Levels Confirmation$', None, r'^Yes$'),
         # The crash on the way out of a QODBC session. The last dialog has
@@ -341,13 +348,14 @@ try:
             ('sent mouse messages', lambda: send_mouse_messages_sync(button_handle)),
         ]
 
-        # WM_CLOSE maps to a dialog's cancel action, so it is only tried where
-        # that matches the button we were aiming for. On a confirmation it would
-        # pick the opposite answer. It is also deliberately late: it clears the
-        # dialog without running the button's own handler, which is the
-        # suspected cause of QuickBooks crashing immediately afterwards.
-        if closing_matches_intent(control_label(button)):
-            attempts.append(('WM_CLOSE', lambda: send_close(dialog_handle)))
+        # WM_CLOSE is deliberately not in this list. It does clear a dialog
+        # without a desktop, but it dismisses the window without running the
+        # button's own handler, and every run that used it on the security
+        # prompt had QuickBooks crash straight afterwards. Where a real button
+        # exists, failing loudly beats crashing QuickBooks - the run fails
+        # either way, and this way the log says why. It is still used for
+        # dialogs that have no button control at all, where there is nothing
+        # else to try and the application has already fallen over.
 
         # Real input is last: it needs an interactive desktop, so it is the one
         # that stops working the moment nobody is looking at the screen.
@@ -953,45 +961,6 @@ try:
             return None 
         
         
-    def datatype_conversion(df,table_name):
-        """
-        Converts dataframe column datatypes to appropriate formats for Deltalake.
-        Returns the converted dataframe.
-        """
-        try:
-            dtype = dict(df.schema)
-            for cols in df.columns:
-                if "String" in str(dtype[cols]):
-                    df = df.with_columns([
-                        pl.col(cols).fill_null("").cast(pl.Utf8)
-                    ])
-                elif "Date" in str(dtype[cols]):
-
-                    df = df.with_columns(
-                        pl.col(cols).cast(pl.Utf8)
-                    )
-                    df = df.with_columns(
-                        pl.col(cols).str.to_datetime()
-                    )
-                elif "Decimal" in str(dtype[cols]):
-                    df = df.with_columns(
-                        pl.col(cols).fill_null(0).cast(pl.Float64)
-                    )
-                elif "Int" in str(dtype[cols]):
-                    df = df.with_columns(
-                        pl.col(cols).fill_null(0).cast(pl.Int64)
-                    )
-                elif "Bool" in str(dtype[cols]):
-                    df = df.with_columns(
-                        pl.col(cols).cast(pl.Boolean))
-                    
-            logger.info(f" >> \t Datatype conversion done for {table_name}\n")
-            return df
-        
-        except Exception as e:
-            logger.error(f" >> Failed in the datatype_conversion {str(e)}\n")
-            return None
-     
     def load_data(df, primary_key, table_path, overwrite, load_type, storage_options):
         """
         Loads the dataframe to Deltalake using the specified mode and options.
