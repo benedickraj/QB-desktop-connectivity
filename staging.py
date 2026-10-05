@@ -162,9 +162,14 @@ try:
         # security settings, and QODBC does not need the features it warns about.
         (r'^Internet Security Levels Are Set Too High$', None, r'^Cancel$'),
         (r'^Internet Security Levels Confirmation$', None, r'^Yes$'),
-        # The crash on the way out of a QODBC session.
+        # The crash on the way out of a QODBC session. The last dialog has
+        # been seen under two different titles - the company name plus the
+        # QuickBooks edition, and 'AVMTimer: QBW.EXE - Fatal Application
+        # Exit' - so both are matched. 'Fatal Application Exit' in a title
+        # needs no text guard; OK is the only thing to do with it.
         (r'^QuickBooks - Unrecoverable Error$', None, r'^Don.?t Send$'),
         (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$'),
+        (r'.*Fatal Application Exit.*', None, r'^OK$'),
     ]
 
     def control_label(control):
