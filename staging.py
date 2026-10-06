@@ -1085,18 +1085,7 @@ try:
         receiver_emails = credential['emailto']
 
 
-        # Accept either a proper list of addresses or addresses joined by commas
-        # inside one entry. iconfig.yml has been seen holding all three in a
-        # single list element, which smtplib then sends as one malformed
-        # recipient - the server refuses it and no mail goes out.
-        if isinstance(receiver_emails, str):
-            receiver_emails = [receiver_emails]
-        receiver_emails = sorted({
-            address.strip()
-            for entry in (receiver_emails or [])
-            for address in str(entry).split(',')
-            if address.strip()
-        })
+        receiver_emails = list(set(receiver_emails))
 
         succeeded = [name for name, status in dsn_status.items() if str(status).startswith('Success')]
         failed = [name for name, status in dsn_status.items() if not str(status).startswith('Success')]
