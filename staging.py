@@ -1085,7 +1085,18 @@ try:
         receiver_emails = credential['emailto']
 
 
-        receiver_emails = list(set(receiver_emails))
+        # Accept either a proper list of addresses or addresses joined by commas
+        # inside one entry. iconfig.yml has been seen holding all three in a
+        # single list element, which smtplib then sends as one malformed
+        # recipient - the server refuses it and no mail goes out.
+        if isinstance(receiver_emails, str):
+            receiver_emails = [receiver_emails]
+        receiver_emails = sorted({
+            address.strip()
+            for entry in (receiver_emails or [])
+            for address in str(entry).split(',')
+            if address.strip()
+        })
 
         succeeded = [name for name, status in dsn_status.items() if str(status).startswith('Success')]
         failed = [name for name, status in dsn_status.items() if not str(status).startswith('Success')]
@@ -1230,7 +1241,13 @@ try:
                 return 'Email not configured to send.'
             
         except Exception as e:
-            result = "Email sending failed:", str(e) 
+            # Previously this swallowed the error into a local that nothing
+            # read, so a failed send left no trace at all and the log simply
+            # stopped after the upload.
+            result = f"Email sending failed: {e}"
+            recipients = ', '.join(receiver_emails) or '(no recipients configured)'
+            logger.error(f" >> Failed to send the notification email to {recipients}: {e}\n")
+            return result
 
     def company_file_for_dsn(dsn_name):
         """
