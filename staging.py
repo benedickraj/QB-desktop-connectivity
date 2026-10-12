@@ -21,7 +21,6 @@ from email.mime.multipart import MIMEMultipart
 import asyncio
 import threading
 import sys
-import subprocess
 import winreg
 from pywinauto import Application, Desktop
 
@@ -695,48 +694,22 @@ try:
             logger.error(f" >> Error in killing QuickBooks process: {str(e)}\n")
             return []
 
-    def relaunch_quickbooks_processes(qb_processes, qb_path=None, delay_seconds=60):
+    def shut_down_quickbooks():
         """
-        Relaunch QuickBooks processes from a list produced by
-        `kill_quickbooks_process`.
+        Shut QuickBooks down and leave it down.
 
-        Args:
-            qb_processes (list): List of dicts with 'name' and 'exe' keys.
-            qb_path (str): Executable to fall back on when psutil could not read
-                the exe path of the killed process.
-            delay_seconds (int): Seconds to wait before attempting relaunch.
+        This used to relaunch it afterwards, but the relaunch was
+        `subprocess.Popen([qb_path])` with no company file argument, so what came
+        back up sat on the "No QuickBooks Company Loaded" screen. That instance
+        is no use to anyone: it serves no connection, it crashes on its own, and
+        it leaves "QBW.EXE - Fatal Application Exit" on the desktop for the next
+        run to trip over - which is how a run ended up clearing that dialog every
+        six seconds for an hour and three quarters.
+
+        There is nothing to put back. QODBC starts QuickBooks itself, against the
+        right company file, whenever it opens a connection.
         """
-        try:
-            if not qb_processes:
-                logger.info(" >> No QuickBooks processes to relaunch.\n")
-                return
-
-            logger.info(f" >> Waiting {delay_seconds} second(s) before relaunch...\n")
-            time.sleep(delay_seconds)
-
-            for qb in qb_processes:
-                try:
-                    exe_path = qb.get('exe') or qb_path
-                    if exe_path:
-                        subprocess.Popen([exe_path])
-                        logger.info(f" >> Relaunched QuickBooks process: {qb.get('name')}\n")
-                    else:
-                        logger.warning(f" >> No executable path for process {qb.get('name')}; cannot relaunch.\n")
-                except Exception as e:
-                    logger.error(f" >> Error relaunching QuickBooks process {qb.get('name')}: {str(e)}\n")
-
-        except Exception as e:
-            logger.error(f" >> Error in relaunching QuickBooks processes: {str(e)}\n")
-
-    def restart_quickbooks(qb_path=None):
-        """
-        Force restart of QuickBooks: kill every running instance and bring the
-        same executables back up. Used as the recovery step for connection
-        failures that a graceful logout could not resolve.
-        """
-        qb_processes = kill_quickbooks_process()
-        relaunch_quickbooks_processes(qb_processes, qb_path)
-        return qb_processes
+        return kill_quickbooks_process()
 
     def logout_quickbooks(qb_path):
         """
@@ -1376,8 +1349,8 @@ try:
                         logout_quickbooks(qb_path)
                         await asyncio.sleep(30)
                     else:
-                        logger.info(f'Attempt {retries}: Graceful logout did not release the company file. Restarting QuickBooks...\n')
-                        restart_quickbooks(qb_path)
+                        logger.info(f'Attempt {retries}: Graceful logout did not release the company file. Shutting QuickBooks down...\n')
+                        shut_down_quickbooks()
                 else:
                     logger.info(f"Attempt {retries}: unable to connect quickbooks through pyodbc..Retrying in 5 minutes...")
                     await asyncio.sleep(300)
@@ -1386,7 +1359,7 @@ try:
                 return None, True, None
 
         logger.error(f'Max retries reached. Connection failed..\n')
-        restart_quickbooks(qb_path)
+        shut_down_quickbooks()
         return None, True, None
 
     def consume_initial_load_flag(dsn_name):
@@ -1750,7 +1723,7 @@ try:
             load_failed = True
             dsn_status[dsn_name] = f'Failed - {str(e)}'
             close_connection(connection, 'failure')
-            restart_quickbooks(qb_path)
+            shut_down_quickbooks()
             return
         
     async def run_all_dsns():
@@ -1793,8 +1766,8 @@ try:
         for name, status in dsn_status.items():
             logger.info(f" >>   {name} : {status}\n")
 
-        # Bring QuickBooks back up for the user / the next scheduled run
-        restart_quickbooks(qb_path)
+        # Leave QuickBooks shut down rather than running with no company file.
+        shut_down_quickbooks()
 
     def validate_config(config):
         """
