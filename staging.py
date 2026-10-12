@@ -375,6 +375,52 @@ try:
     # not write a line every few seconds for hours.
     _dialog_complaints = {}
 
+    # How many times each dialog has been cleared, so a dialog that keeps coming
+    # back is reported as the recurring problem it is rather than as a thousand
+    # identical log lines. A dialog reappearing every few seconds means the
+    # application behind it is restarting in a loop, which is worth saying once
+    # and loudly instead of burying the rest of the run.
+    _dialog_dismissals = {}
+    DIALOG_RECURRENCE_WARNING_AT = 20
+    DIALOG_SUMMARY_INTERVAL = 300
+
+    def note_dismissed(title, how):
+        """
+        Record that a dialog was cleared, and log it without flooding.
+
+        The first one is logged in full. After that a periodic summary carries
+        the count, and crossing DIALOG_RECURRENCE_WARNING_AT warns once that the
+        dialog is recurring - which is the signal that something is wrong beyond
+        the dialog itself.
+        """
+        now = time.time()
+        state = _dialog_dismissals.setdefault(
+            title, {'count': 0, 'first': now, 'last_log': 0.0, 'warned': False})
+        state['count'] += 1
+
+        if state['count'] == 1:
+            state['last_log'] = now
+            logger.info(f" >> Dismissed QuickBooks dialog '{title}' via {how}.\n")
+            return
+
+        if not state['warned'] and state['count'] >= DIALOG_RECURRENCE_WARNING_AT:
+            state['warned'] = True
+            state['last_log'] = now
+            elapsed = int(now - state['first'])
+            logger.error(
+                f" >> Dialog '{title}' has come back {state['count']} times in {elapsed}s. "
+                f"It is being cleared each time, but something is putting it back - "
+                f"QuickBooks is most likely restarting in a loop. Further dismissals "
+                f"of this dialog will be summarised rather than logged individually.\n"
+            )
+            return
+
+        if now - state['last_log'] >= DIALOG_SUMMARY_INTERVAL:
+            state['last_log'] = now
+            elapsed = int(now - state['first'])
+            logger.info(f" >> Dialog '{title}' cleared {state['count']} times so far "
+                        f"(over {elapsed}s).\n")
+
     def note_unclickable(window, title, desktop, interval=300):
         """
         Log that a dialog would not close, at most once every `interval` seconds,
@@ -487,8 +533,7 @@ try:
                             note_unclickable(win, title, desktop)
                             continue
                         _dialog_complaints.pop(title, None)
-                        logger.info(f" >> Dismissed QuickBooks dialog '{title}' via WM_CLOSE "
-                                    f"(no button control found).\n")
+                        note_dismissed(title, 'WM_CLOSE (no button control found)')
                         dismissed += 1
                         continue
 
@@ -498,7 +543,7 @@ try:
                         continue
 
                     _dialog_complaints.pop(title, None)
-                    logger.info(f" >> Dismissed QuickBooks dialog '{title}' via {how}.\n")
+                    note_dismissed(title, how)
                     dismissed += 1
                 except Exception:
                     continue
