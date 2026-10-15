@@ -149,11 +149,22 @@ try:
     # nothing. That is what stranded a run for 24 minutes: the theme warning and
     # the crash dialog were sitting on top of the security prompt.
     BLOCKING_QB_DIALOGS = [
+        # (window title regex, text the window must contain or None,
+        #  button to click, regex the button's class must match or None)
+        #
+        # The class pattern exists for dialogs whose body text is not readable.
+        # QuickBooks' Maui dialogs draw their message instead of putting it in a
+        # child control - a probe of the security prompt found only an empty Edit
+        # and three MauiPushButtons, no message anywhere - so a text guard on one
+        # of those can never be satisfied and the entry silently never fires.
+        # Matching the MauiPushButton class instead keeps a generic title like
+        # "Warning" from firing on somebody else's dialog.
+
         # Raised when the desktop theme changes underneath QuickBooks, which is
-        # what happens when an RDP session disconnects.
-        (r'^Warning$', 'Theme settings have changed', r'^OK$'),
+        # what happens when an RDP session connects or disconnects.
+        (r'^Warning$', None, r'^OK$', r'Maui'),
         # Windows Error Reporting, after QuickBooks has fallen over.
-        (r'^QuickBooks$', 'has stopped working', r'^Close the program'),
+        (r'^QuickBooks$', 'has stopped working', r'^Close the program', None),
         # Shown while the company file opens when the IE zone security level is
         # above default. QODBC then fails the connect with 80040414, "a modal
         # dialog box is showing in the QuickBooks user interface".
@@ -166,16 +177,16 @@ try:
         # setting after an update, and because an entry that never matches costs
         # nothing. If they start appearing in the log again, check that
         # registry value first.
-        (r'^Internet Security Levels Are Set Too High$', None, r'^Cancel$'),
-        (r'^Internet Security Levels Confirmation$', None, r'^Yes$'),
+        (r'^Internet Security Levels Are Set Too High$', None, r'^Cancel$', None),
+        (r'^Internet Security Levels Confirmation$', None, r'^Yes$', None),
         # The crash on the way out of a QODBC session. The last dialog has
         # been seen under two different titles - the company name plus the
         # QuickBooks edition, and 'AVMTimer: QBW.EXE - Fatal Application
         # Exit' - so both are matched. 'Fatal Application Exit' in a title
         # needs no text guard; OK is the only thing to do with it.
-        (r'^QuickBooks - Unrecoverable Error$', None, r'^Don.?t Send$'),
-        (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$'),
-        (r'.*Fatal Application Exit.*', None, r'^OK$'),
+        (r'^QuickBooks - Unrecoverable Error$', None, r'^Don.?t Send$', None),
+        (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$', None),
+        (r'.*Fatal Application Exit.*', None, r'^OK$', None),
     ]
 
     def control_label(control):
@@ -465,6 +476,78 @@ try:
         except Exception:
             pass
 
+    # MauiForm is QuickBooks' dialog class; MauiFrame is its main window and is
+    # deliberately not here.
+    _QB_DIALOG_CLASSES = ('MauiForm', '#32770')
+    _QB_TITLE_HINTS = ('quickbooks', 'intuit', 'qbw.exe')
+    _lingering_dialogs = {}
+
+    def report_lingering_dialogs(desktop, settle_seconds=30, repeat_seconds=300):
+        """
+        Log any dialog still sitting on screen after a dismissal pass.
+
+        Deliberately not "any dialog we do not recognise": a dialog can match a
+        known title and still be left alone - a text guard that cannot be
+        satisfied, a class guard that rejects it - and those were as silent as
+        an unknown one. What matters is only whether something is still there,
+        because QODBC cannot start a session while a modal dialog is up and the
+        single symptom is a connection timeout with nothing in the log.
+
+        A dialog has `settle_seconds` to be cleared before it is reported, so
+        one that the next poll handles does not produce noise, and is then
+        repeated no more often than `repeat_seconds`.
+        """
+        try:
+            windows = desktop.windows(top_level_only=True)
+        except Exception:
+            return
+
+        now = time.time()
+        seen = set()
+
+        for win in windows:
+            try:
+                if not win.is_visible():
+                    continue
+                title = win.window_text().strip()
+                window_class = win.element_info.class_name or ''
+            except Exception:
+                continue
+
+            if not title or window_class == 'MauiFrame':
+                # No title, or the main application window rather than a dialog.
+                continue
+            looks_like_ours = (
+                window_class in _QB_DIALOG_CLASSES
+                or any(hint in title.lower() for hint in _QB_TITLE_HINTS)
+            )
+            if not looks_like_ours:
+                continue
+
+            key = f'{window_class}|{title}'
+            seen.add(key)
+            state = _lingering_dialogs.setdefault(key, {'first': now, 'last_log': 0.0})
+
+            if now - state['first'] < settle_seconds:
+                continue
+            if now - state['last_log'] < repeat_seconds:
+                continue
+            state['last_log'] = now
+
+            try:
+                labels = [label for label in (control_label(c) for c in win.descendants()) if label]
+            except Exception:
+                labels = []
+            logger.error(
+                f" >> A dialog has been on screen for {int(now - state['first'])}s and nothing "
+                f"here has cleared it: title={title!r} class={window_class} "
+                f"controls={labels[:12]}. QODBC cannot start a session while a modal "
+                f"dialog is up, so expect this to surface as a connection timeout.\n"
+            )
+
+        for key in [k for k in _lingering_dialogs if k not in seen]:
+            _lingering_dialogs.pop(key, None)
+
     def dismiss_blocking_dialogs():
         """
         Clicks away any known blocking QuickBooks dialog currently on screen.
@@ -485,7 +568,7 @@ try:
             logger.error(f" >> Could not reach the desktop to look for QuickBooks dialogs: {e}\n")
             return 0
 
-        for title_re, required_text, button_re in BLOCKING_QB_DIALOGS:
+        for title_re, required_text, button_re, button_class_re in BLOCKING_QB_DIALOGS:
             try:
                 windows = desktop.windows(title_re=title_re, top_level_only=True)
             except Exception:
@@ -512,9 +595,17 @@ try:
                     # WindowSpecification.
                     button = None
                     for candidate in controls:
-                        if re.match(button_re, control_label(candidate)):
-                            button = candidate
-                            break
+                        if not re.match(button_re, control_label(candidate)):
+                            continue
+                        if button_class_re:
+                            try:
+                                candidate_class = candidate.element_info.class_name or ''
+                            except Exception:
+                                candidate_class = ''
+                            if not re.search(button_class_re, candidate_class):
+                                continue
+                        button = candidate
+                        break
 
                     if button is None:
                         # Some dialogs have no real button to press - Windows
@@ -523,7 +614,11 @@ try:
                         # turns up in descendants(). Closing those does the same
                         # thing as their default option, so try that rather than
                         # giving up with the dialog still on screen.
-                        if not closing_matches_intent(button_re):
+                        # A class pattern is how this entry identifies the
+                        # dialog at all. If no button of that class is here,
+                        # this is not our dialog and closing it would be
+                        # reaching into somebody else's window.
+                        if button_class_re or not closing_matches_intent(button_re):
                             note_unclickable(win, title, desktop)
                             continue
                         send_close(win.handle)
@@ -547,6 +642,7 @@ try:
                 except Exception:
                     continue
 
+        report_lingering_dialogs(desktop)
         return dismissed
 
     _dialog_watcher = {'stop': None, 'thread': None}
