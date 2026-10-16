@@ -197,11 +197,15 @@ try:
         (r'^QuickBooks - Unrecoverable Error$', None, r'^Don.?t Send$', None),
         (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$', None),
         (r'.*Fatal Application Exit.*', None, r'^OK$', None),
-
-        # Deliberately absent: the 'Intuit account' sign-in window. It asks for
-        # credentials, and nothing here should be typing those or clicking
-        # through an authentication prompt on somebody's behalf. When it appears
-        # it is reported by report_lingering_dialogs and a person signs in.
+        # The Intuit Account prompt QuickBooks shows when a company file is
+        # opened for the first time. It is a nag, not an authentication step:
+        # closing it is what a person does, and the file opens regardless. It is
+        # a WPF window with no enumerable child controls, so there is no button
+        # to press - hence no button pattern, which means close the window.
+        #
+        # Closing is all this does. Nothing here signs in, enters credentials or
+        # clicks through an authentication flow, and it should stay that way.
+        (r'^Intuit account$', None, None, None),
     ]
 
     def control_label(control):
@@ -610,6 +614,10 @@ try:
                     # WindowSpecification.
                     button = None
                     for candidate in controls:
+                        if not button_re:
+                            # The entry asks for the window to be closed rather
+                            # than for a button to be pressed.
+                            break
                         if not re.match(button_re, control_label(candidate)):
                             continue
                         if button_class_re:
