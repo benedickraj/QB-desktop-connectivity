@@ -165,6 +165,16 @@ try:
         (r'^Warning$', None, r'^OK$', r'Maui'),
         # Windows Error Reporting, after QuickBooks has fallen over.
         (r'^QuickBooks$', 'has stopped working', r'^Close the program', None),
+        # IE Enhanced Security Configuration blocking a page QuickBooks wants to
+        # load - seen when QuickBooks tries to show the Intuit Account sign-in
+        # from https://http-download.intuit.com. Close only dismisses the notice;
+        # it changes no security setting, unlike the Add... button beside it.
+        #
+        # Note this clears the dialog, not the cause. If QuickBooks has been
+        # signed out of its Intuit Account it will keep trying to reach that
+        # page, and somebody has to sign in. The account window itself is
+        # deliberately not handled here - see the comment at the end of this list.
+        (r'^Internet Explorer$', 'Enhanced Security Configuration', r'^Close$', None),
         # Shown while the company file opens when the IE zone security level is
         # above default. QODBC then fails the connect with 80040414, "a modal
         # dialog box is showing in the QuickBooks user interface".
@@ -187,6 +197,11 @@ try:
         (r'^QuickBooks - Unrecoverable Error$', None, r'^Don.?t Send$', None),
         (r'.*Intuit QuickBooks.*', 'Aborting Application', r'^OK$', None),
         (r'.*Fatal Application Exit.*', None, r'^OK$', None),
+
+        # Deliberately absent: the 'Intuit account' sign-in window. It asks for
+        # credentials, and nothing here should be typing those or clicking
+        # through an authentication prompt on somebody's behalf. When it appears
+        # it is reported by report_lingering_dialogs and a person signs in.
     ]
 
     def control_label(control):
