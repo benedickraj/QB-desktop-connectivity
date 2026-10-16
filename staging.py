@@ -163,8 +163,14 @@ try:
         # Raised when the desktop theme changes underneath QuickBooks, which is
         # what happens when an RDP session connects or disconnects.
         (r'^Warning$', None, r'^OK$', r'Maui'),
-        # Windows Error Reporting, after QuickBooks has fallen over.
-        (r'^QuickBooks$', 'has stopped working', r'^Close the program', None),
+        # Windows Error Reporting, after QuickBooks has fallen over. No text
+        # guard: the "QuickBooks has stopped working" heading is drawn, not
+        # exposed as a control - a run found controls=['Close the program',
+        # 'Debug the program'] and nothing else, so a guard on that wording can
+        # never be satisfied and the entry silently never fires. A window titled
+        # exactly "QuickBooks" carrying a "Close the program" button is
+        # unambiguous on its own.
+        (r'^QuickBooks$', None, r'^Close the program', None),
         # IE Enhanced Security Configuration blocking a page QuickBooks wants to
         # load - seen when QuickBooks tries to show the Intuit Account sign-in
         # from https://http-download.intuit.com. Close only dismisses the notice;
@@ -512,6 +518,11 @@ try:
         because QODBC cannot start a session while a modal dialog is up and the
         single symptom is a connection timeout with nothing in the log.
 
+        Grouped by title, with a count. QuickBooks can spawn the same dialog
+        over and over - a run saw more than a hundred "Intuit Account" windows -
+        and each carries a different GUID in its class name, so keying on the
+        class produced one report per window and buried everything else.
+
         A dialog has `settle_seconds` to be cleared before it is reported, so
         one that the next poll handles does not produce noise, and is then
         repeated no more often than `repeat_seconds`.
@@ -522,7 +533,7 @@ try:
             return
 
         now = time.time()
-        seen = set()
+        found = {}
 
         for win in windows:
             try:
@@ -543,10 +554,11 @@ try:
             if not looks_like_ours:
                 continue
 
-            key = f'{window_class}|{title}'
-            seen.add(key)
-            state = _lingering_dialogs.setdefault(key, {'first': now, 'last_log': 0.0})
+            group = found.setdefault(title, {'count': 0, 'window': win, 'class': window_class})
+            group['count'] += 1
 
+        for title, group in found.items():
+            state = _lingering_dialogs.setdefault(title, {'first': now, 'last_log': 0.0})
             if now - state['first'] < settle_seconds:
                 continue
             if now - state['last_log'] < repeat_seconds:
@@ -554,18 +566,19 @@ try:
             state['last_log'] = now
 
             try:
-                labels = [label for label in (control_label(c) for c in win.descendants()) if label]
+                labels = [label for label in (control_label(c) for c in group['window'].descendants()) if label]
             except Exception:
                 labels = []
+            copies = f" ({group['count']} copies of it are open)" if group['count'] > 1 else ''
             logger.error(
                 f" >> A dialog has been on screen for {int(now - state['first'])}s and nothing "
-                f"here has cleared it: title={title!r} class={window_class} "
+                f"here has cleared it{copies}: title={title!r} class={group['class']} "
                 f"controls={labels[:12]}. QODBC cannot start a session while a modal "
                 f"dialog is up, so expect this to surface as a connection timeout.\n"
             )
 
-        for key in [k for k in _lingering_dialogs if k not in seen]:
-            _lingering_dialogs.pop(key, None)
+        for title in [t for t in _lingering_dialogs if t not in found]:
+            _lingering_dialogs.pop(title, None)
 
     def dismiss_blocking_dialogs():
         """
