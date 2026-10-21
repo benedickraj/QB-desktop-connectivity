@@ -23,6 +23,7 @@ import threading
 import sys
 import winreg
 from pywinauto import Application, Desktop
+import pythoncom
 
 script_path = Path(__file__).resolve() if '__file__' in globals() else Path(sys.argv[0]).resolve()
 script_dir = script_path.parent
@@ -169,17 +170,17 @@ try:
         # 'Debug the program'] and nothing else, so a guard on that wording can
         # never be satisfied and the entry silently never fires. A window titled
         # exactly "QuickBooks" carrying a "Close the program" button is
-        # unambiguous on its own.
+        # unambiguous on its own - but only with the button. A window titled
+        # "QuickBooks" without one is something else of QuickBooks', and is left
+        # alone and reported rather than closed.
         (r'^QuickBooks$', None, r'^Close the program', None),
         # IE Enhanced Security Configuration blocking a page QuickBooks wants to
         # load - seen when QuickBooks tries to show the Intuit Account sign-in
         # from https://http-download.intuit.com. Close only dismisses the notice;
         # it changes no security setting, unlike the Add... button beside it.
         #
-        # Note this clears the dialog, not the cause. If QuickBooks has been
-        # signed out of its Intuit Account it will keep trying to reach that
-        # page, and somebody has to sign in. The account window itself is
-        # deliberately not handled here - see the comment at the end of this list.
+        # Note this clears the dialog, not the cause: the fix for that is the
+        # domain being in the account's trusted sites, or ESC being off.
         (r'^Internet Explorer$', 'Enhanced Security Configuration', r'^Close$', None),
         # Shown while the company file opens when the IE zone security level is
         # above default. QODBC then fails the connect with 80040414, "a modal
@@ -209,8 +210,17 @@ try:
         # a WPF window with no enumerable child controls, so there is no button
         # to press - hence no button pattern, which means close the window.
         #
-        # Closing is all this does. Nothing here signs in, enters credentials or
-        # clicks through an authentication flow, and it should stay that way.
+        # Closing it raises a confirmation, titled with a capital A - "We'll
+        # remind you to sign in to Intuit Account after 14 days" - with Cancel
+        # and Continue to Sign in. Cancel is the one that declines; it is
+        # pressed through UI Automation because this is WPF too (see
+        # press_wpf_button). The titles differ only in case, and the match is
+        # case-sensitive, so each entry hits only its own window.
+        #
+        # Closing and declining is all this does. Nothing here signs in, enters
+        # credentials or clicks through an authentication flow, and it should
+        # stay that way - never add Continue to Sign in, or anything like it.
+        (r'^Intuit Account$', None, r'^Cancel$', None),
         (r'^Intuit account$', None, None, None),
     ]
 
@@ -230,6 +240,51 @@ try:
             return window.is_visible()
         except Exception:
             return False
+
+    def is_wpf_window(window):
+        """
+        True for a WPF window. WPF draws its controls inside a single native
+        window, so the win32 backend sees no buttons in it at all.
+        """
+        try:
+            return (window.element_info.class_name or '').startswith('HwndWrapper')
+        except Exception:
+            return False
+
+    def wpf_controls(window):
+        """A WPF window's controls, as UI Automation sees them."""
+        try:
+            return Desktop(backend='uia').window(handle=window.handle).wrapper_object().descendants()
+        except Exception:
+            return []
+
+    def press_wpf_button(window, button_re):
+        """
+        Press a button in a WPF window through UI Automation.
+
+        The message-based presses in press_button need a native button handle to
+        aim at, and a WPF window has none. UI Automation does see its buttons,
+        and the Invoke pattern runs the button's own click handler without
+        synthesising any input - so, like the messages, it works with nobody at
+        the screen.
+
+        Returns the name of what worked, or None.
+        """
+        for candidate in wpf_controls(window):
+            try:
+                if candidate.element_info.control_type != 'Button':
+                    continue
+            except Exception:
+                continue
+            if not re.match(button_re, control_label(candidate)):
+                continue
+            try:
+                candidate.invoke()
+            except Exception:
+                return None
+            time.sleep(1)
+            return None if window_is_up(window) else 'UI Automation'
+        return None
 
     # Win32 message constants used to press a button without an interactive
     # desktop. See press_button below for why that matters.
@@ -566,7 +621,10 @@ try:
             state['last_log'] = now
 
             try:
-                labels = [label for label in (control_label(c) for c in group['window'].descendants()) if label]
+                controls = group['window'].descendants()
+                if not controls and is_wpf_window(group['window']):
+                    controls = wpf_controls(group['window'])
+                labels = [label for label in (control_label(c) for c in controls) if label]
             except Exception:
                 labels = []
             copies = f" ({group['count']} copies of it are open)" if group['count'] > 1 else ''
@@ -612,6 +670,12 @@ try:
                     # window starts closing.
                     title = win.window_text()
 
+                    if (win.element_info.class_name or '') == 'MauiFrame':
+                        # QuickBooks' own main window, which can be titled just
+                        # "QuickBooks" while a company file is opening. Never a
+                        # dialog, and closing it closes QuickBooks.
+                        continue
+
                     try:
                         controls = win.descendants()
                     except Exception:
@@ -621,6 +685,16 @@ try:
                         haystack = ' '.join([title] + [control_label(c) for c in controls]).lower()
                         if required_text.lower() not in haystack:
                             continue
+
+                    if not _user32.IsWindowEnabled(win.handle):
+                        # Something modal is on top of it, and that has to be
+                        # cleared first. Nothing is sent here: a disabled window
+                        # still receives posted messages, and WM_CLOSE to the
+                        # Intuit account window while its confirmation was up
+                        # opened another confirmation on every poll - six in two
+                        # minutes on one run, over a hundred on another.
+                        note_unclickable(win, title, desktop)
+                        continue
 
                     # descendants() is used rather than child_window(): windows()
                     # hands back wrappers, and child_window() only exists on a
@@ -643,19 +717,33 @@ try:
                         button = candidate
                         break
 
+                    if button is None and button_re and is_wpf_window(win):
+                        # WPF: the button is there, just invisible to win32.
+                        how = press_wpf_button(win, button_re)
+                        if how is not None:
+                            _dialog_complaints.pop(title, None)
+                            note_dismissed(title, how)
+                            dismissed += 1
+                            continue
+
                     if button is None:
-                        # Some dialogs have no real button to press - Windows
-                        # Error Reporting draws its options as task-dialog
-                        # command links rather than child windows, so nothing
-                        # turns up in descendants(). Closing those does the same
-                        # thing as their default option, so try that rather than
-                        # giving up with the dialog still on screen.
-                        # A class pattern is how this entry identifies the
-                        # dialog at all. If no button of that class is here,
-                        # this is not our dialog and closing it would be
-                        # reaching into somebody else's window.
-                        if button_class_re or not closing_matches_intent(button_re):
-                            note_unclickable(win, title, desktop)
+                        # Close the window instead only where that is plainly
+                        # what the entry wants: it names no button at all, or
+                        # it is a WPF window whose button UI Automation could
+                        # not reach and closing does the same as that button.
+                        #
+                        # Not for an ordinary dialog that is merely missing the
+                        # button. Its controls are visible, and the one we want
+                        # is not among them, so this is a different window that
+                        # happens to share the title - "QuickBooks" is shared by
+                        # plenty. A class pattern says the same: no button of
+                        # that class means not our dialog.
+                        wpf_fallback = (is_wpf_window(win) and not button_class_re
+                                        and closing_matches_intent(button_re))
+                        if button_re and not wpf_fallback:
+                            # Not our dialog, so nothing to say about clicking
+                            # it. If it stays up, report_lingering_dialogs logs
+                            # it with its class and controls.
                             continue
                         send_close(win.handle)
                         time.sleep(1)
@@ -696,6 +784,12 @@ try:
         stop = threading.Event()
 
         def _watch():
+            # UI Automation, used for the WPF Intuit windows, is COM, and COM
+            # has to be initialised on each thread that uses it.
+            try:
+                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            except Exception:
+                pass
             while not stop.wait(interval):
                 dismiss_blocking_dialogs()
 
